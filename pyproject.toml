@@ -1,0 +1,16 @@
+[project]
+name = "safeguard-miner"
+version = "0.0.1"
+description = "Third-party adversarial mining rig for the Safeguard Bittensor subnet"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "httpx",
+  "python-dotenv",
+  "bittensor",
+  "bittensor-wallet",
+]
+
+[tool.setuptools]
+py-modules = ["miner", "prober", "score"]
