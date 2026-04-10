@@ -1,18 +1,15 @@
 # safeguard-miner
 
-A third-party mining rig for the [Safeguard](https://github.com/.../safeguard) Bittensor subnet.
+A mining setup for the [Safeguard](https://github.com/.../safeguard) Bittensor subnet.
 
 ## Roleplay frame
 
-Built by an outside operator who found Safeguard on the subnet list and decided
-to mine it. No insider access — only what's in the open-source `safeguard/` repo,
-the whitepaper, and what comes back over the wire. The rig is built as a
-"cooperative antagonist": it competes with the example miner by producing better
+Built as a "cooperative antagonist": it competes with the example miner by producing better
 adversarial probes, but everything it does is on-protocol.
 
 ## What the validator actually rewards
 
-Read once and burn into your retinas (`safeguard/validator.py:489`, `:680`):
+(`safeguard/validator.py:489`, `:680`):
 
 ```
 contribution     = findings_reward + bait_modifier        # bait is a tiny floor
