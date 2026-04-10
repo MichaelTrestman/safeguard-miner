@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safeguard-miner
+  namespace: safeguard-miner
+  labels: { app: safeguard-miner }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: safeguard-miner }
+  template:
+    metadata:
+      labels: { app: safeguard-miner }
+    spec:
+      containers:
+        - name: miner
+          image: us-central1-docker.pkg.dev/safeguard-testnet/safeguard/safeguard-miner:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8090
+              name: http
+          env:
+            - name: WALLET_NAME
+              value: "miner2"
+            - name: HOTKEY_NAME
+              value: "default"
+            - name: NETWORK
+              value: "test"
+            - name: NETUID
+              value: "444"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8090"
+            # The LoadBalancer's external IP — set after the Service is
+            # created. The miner commits this to chain so validators
+            # anywhere on the internet can reach it.
+            - name: MINER_EXTERNAL_ENDPOINT
+              value: "REPLACE_WITH_EXTERNAL_IP:8090"
+            - name: MINER_ATTACK_MODEL
+              value: "deepseek-ai/DeepSeek-V3.1-TEE"
+            - name: MINER_JUDGE_MODEL
+              value: "deepseek-ai/DeepSeek-V3.1-TEE"
+            - name: CHUTES_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: miner-secrets
+                  key: chutes-api-key
+          volumeMounts:
+            - name: wallets
+              mountPath: /root/.bittensor/wallets/miner2/hotkeys/default
+              subPath: hotkey
+              readOnly: true
+            - name: wallets
+              mountPath: /root/.bittensor/wallets/miner2/coldkeypub.txt
+              subPath: coldkeypub.txt
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: wallets
+          secret:
+            secretName: wallet-miner2
+---
+# LoadBalancer gives the miner a public IP so any validator on any
+# network can reach it via the chain commitment.
+apiVersion: v1
+kind: Service
+metadata:
+  name: safeguard-miner
+  namespace: safeguard-miner
+spec:
+  type: LoadBalancer
+  selector: { app: safeguard-miner }
+  ports:
+    - port: 8090
+      targetPort: 8090
+      name: http
