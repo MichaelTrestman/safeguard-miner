@@ -101,19 +101,29 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
     task_id = body.get("task_id", "unknown")
     target_validator_endpoint = body.get("target_validator_endpoint", "")
     scenario_category = body.get("scenario_category", "")
+    # v2 provenance fields (RELAY_PROTOCOL_V2). When the Safeguard
+    # validator sends these, we route per-turn calls through
+    # /probe/relay on the validator instead of directly to the client
+    # v1 /relay, and echo the response_commitment into each transcript
+    # entry. If absent, fall back to v1 path unchanged.
+    safeguard_relay_endpoint = body.get("safeguard_relay_endpoint", "")
+    target_descriptor = body.get("target_descriptor")
 
-    if not target_validator_endpoint:
+    if not target_validator_endpoint and not safeguard_relay_endpoint:
         raise HTTPException(400, "Missing target_validator_endpoint")
 
     logger.info(
         f"Task {task_id} from validator {validator_hotkey[:8]}... "
         f"category={scenario_category}"
+        + (f" [v2 relay]" if safeguard_relay_endpoint else " [v1]")
     )
 
     result = await probe_via_relay(
         wallet=wallet,
         target_validator_endpoint=target_validator_endpoint,
         scenario_category=scenario_category,
+        safeguard_relay_endpoint=safeguard_relay_endpoint,
+        target_descriptor=target_descriptor,
     )
     result["task_id"] = task_id
 

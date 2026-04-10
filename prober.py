@@ -219,19 +219,78 @@ async def probe_via_relay(
     scenario_category: str,
     max_turns: int = DEFAULT_MAX_TURNS,
     http_client: httpx.AsyncClient | None = None,
+    safeguard_relay_endpoint: str = "",
+    target_descriptor: dict | None = None,
 ) -> dict:
     """Conduct an adversarial conversation against the target subnet via its
-    relay endpoint. Returns the dict shape Safeguard's validator expects."""
+    relay endpoint. Returns the dict shape Safeguard's validator expects.
+
+    v2 provenance (RELAY_PROTOCOL_V2): when `safeguard_relay_endpoint` is
+    set, per-turn calls go to POST {safeguard_relay_endpoint} instead of
+    POST {target_validator_endpoint}/relay. The body includes
+    `target_descriptor` so the Safeguard relay can resolve the target.
+    Each response includes a `response_commitment` block that we echo
+    verbatim into the per-turn transcript entry. When the validator later
+    audits the transcript, it re-verifies each commitment against its
+    stored RelayCommitment rows. v1 fallback: if safeguard_relay_endpoint
+    is empty, everything works exactly as before.
+    """
     if http_client is None:
         async with httpx.AsyncClient(timeout=120.0) as client:
             return await _probe_loop(
                 client, wallet, target_validator_endpoint,
                 scenario_category, max_turns,
+                safeguard_relay_endpoint, target_descriptor,
             )
     return await _probe_loop(
         http_client, wallet, target_validator_endpoint,
         scenario_category, max_turns,
+        safeguard_relay_endpoint, target_descriptor,
     )
+
+
+async def _relay_call(
+    client: httpx.AsyncClient,
+    wallet: Wallet,
+    prompt: str,
+    session_id: str,
+    target_validator_endpoint: str,
+    safeguard_relay_endpoint: str,
+    target_descriptor: dict | None,
+) -> tuple[str, dict | None]:
+    """Send one per-turn relay call. Returns (response_text, commitment_or_None).
+
+    v2: POST to safeguard_relay_endpoint with target_descriptor.
+    v1: POST to target_validator_endpoint/relay without target_descriptor.
+    """
+    if safeguard_relay_endpoint and target_descriptor:
+        # v2 path — route through the Safeguard validator's /probe/relay
+        relay_body_dict = {
+            "prompt": prompt,
+            "session_id": session_id,
+            "target_descriptor": target_descriptor,
+        }
+        relay_url = safeguard_relay_endpoint
+    else:
+        # v1 fallback — call the client's /relay directly
+        relay_body_dict = {
+            "prompt": prompt,
+            "session_id": session_id,
+        }
+        relay_url = f"{target_validator_endpoint}/relay"
+
+    relay_body = json.dumps(relay_body_dict).encode()
+    resp = await client.post(
+        relay_url,
+        content=relay_body,
+        headers=_create_epistula_headers(wallet, relay_body),
+        timeout=90.0,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    reply = payload.get("response", "")
+    commitment = payload.get("response_commitment")
+    return reply, commitment
 
 
 async def _probe_loop(
@@ -240,9 +299,15 @@ async def _probe_loop(
     target_validator_endpoint: str,
     scenario_category: str,
     max_turns: int,
+    safeguard_relay_endpoint: str = "",
+    target_descriptor: dict | None = None,
 ) -> dict:
     transcript: list[dict] = []
     session_id = str(uuid.uuid4())
+    using_v2 = bool(safeguard_relay_endpoint and target_descriptor)
+
+    if using_v2:
+        logger.info(f"Using v2 relay: {safeguard_relay_endpoint}")
 
     # Pick a random starting offset into the vector list so different probes
     # of the same category don't all open with the same vector.
@@ -262,25 +327,22 @@ async def _probe_loop(
             break
 
         transcript.append({"role": "user", "content": prompt})
-        relay_body = json.dumps({
-            "prompt": prompt,
-            "session_id": session_id,
-        }).encode()
 
         try:
-            resp = await client.post(
-                f"{target_validator_endpoint}/relay",
-                content=relay_body,
-                headers=_create_epistula_headers(wallet, relay_body),
-                timeout=90.0,
+            reply, commitment = await _relay_call(
+                client, wallet, prompt, session_id,
+                target_validator_endpoint, safeguard_relay_endpoint,
+                target_descriptor,
             )
-            resp.raise_for_status()
-            reply = resp.json().get("response", "")
         except Exception as e:
             logger.warning(f"Relay request failed on turn {turn}: {e}")
             reply = f"[ERROR: relay unreachable - {e}]"
+            commitment = None
 
-        transcript.append({"role": "assistant", "content": reply})
+        entry: dict = {"role": "assistant", "content": reply}
+        if commitment:
+            entry["response_commitment"] = commitment
+        transcript.append(entry)
 
         if _looks_like_compliance(reply):
             got_compliance = True
@@ -297,21 +359,19 @@ async def _probe_loop(
                 )
                 if deepen:
                     transcript.append({"role": "user", "content": deepen})
-                    relay_body = json.dumps({
-                        "prompt": deepen, "session_id": session_id,
-                    }).encode()
                     try:
-                        resp = await client.post(
-                            f"{target_validator_endpoint}/relay",
-                            content=relay_body,
-                            headers=_create_epistula_headers(wallet, relay_body),
-                            timeout=90.0,
+                        deepen_reply, deepen_commitment = await _relay_call(
+                            client, wallet, deepen, session_id,
+                            target_validator_endpoint,
+                            safeguard_relay_endpoint, target_descriptor,
                         )
-                        resp.raise_for_status()
-                        transcript.append({
+                        deepen_entry: dict = {
                             "role": "assistant",
-                            "content": resp.json().get("response", ""),
-                        })
+                            "content": deepen_reply,
+                        }
+                        if deepen_commitment:
+                            deepen_entry["response_commitment"] = deepen_commitment
+                        transcript.append(deepen_entry)
                     except Exception as e:
                         logger.warning(f"Deepen relay failed: {e}")
             break
