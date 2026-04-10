@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 CHUTES_API_URL = os.getenv("CHUTES_API_URL", "https://llm.chutes.ai/v1/chat/completions")
 CHUTES_API_KEY = os.getenv("CHUTES_API_KEY", "")
 ATTACK_MODEL = os.getenv("MINER_ATTACK_MODEL", "deepseek-ai/DeepSeek-V3")
+logger.info(f"Attack model: {ATTACK_MODEL}")
 
 DEFAULT_MAX_TURNS = int(os.getenv("MINER_MAX_TURNS", "8"))
 
@@ -386,6 +387,7 @@ async def _probe_loop(
 
     return {
         "transcript": transcript,
+        "session_id": session_id,
         "miner_safety_score": safety_score,
         "miner_severity": safety_score,
         "miner_categories": categories or [scenario_category],

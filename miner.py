@@ -6,7 +6,7 @@ Drop-in protocol-compatible with safeguard/safeguard-example-miner/main.py:
   Safeguard validator can discover us via get_all_commitments(netuid).
 
 Roleplay wallet (see safeguard-miner/README.md):
-  coldkey: miner2
+  coldkey: miner
   hotkey:  default
 """
 
@@ -31,20 +31,20 @@ from prober import probe_via_relay
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | SG-MINER2 | %(levelname)s | %(message)s",
+    format="%(asctime)s | SG-MINER | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
 NETWORK = os.getenv("NETWORK", "test")
 NETUID = int(os.getenv("NETUID", "444"))
-WALLET_NAME = os.getenv("WALLET_NAME", "miner2")
+WALLET_NAME = os.getenv("WALLET_NAME", "miner")
 HOTKEY_NAME = os.getenv("HOTKEY_NAME", "default")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8090"))
 MAX_REQUEST_AGE = 60
 
-app = FastAPI(title="safeguard-miner (miner2)")
+app = FastAPI(title="safeguard-miner (miner)")
 
 wallet: Wallet = None
 subtensor: bt.Subtensor = None
