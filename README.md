@@ -1,6 +1,6 @@
 # safeguard-miner
 
-A mining setup for the [Safeguard](https://github.com/.../safeguard) Bittensor subnet.
+A mining setup for the [Safeguard](https://github.com/MichaelTrestman/safeguard-subnet) Bittensor subnet.
 
 ## Roleplay frame
 
