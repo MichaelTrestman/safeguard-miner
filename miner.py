@@ -167,8 +167,11 @@ async def startup():
     my_uid = metagraph.hotkeys.index(my_hotkey)
     logger.info(f"safeguard-miner UID={my_uid} hotkey={my_hotkey} on netuid {NETUID} ({NETWORK})")
 
-    commit_host = "127.0.0.1" if HOST == "0.0.0.0" else HOST
-    endpoint_data = json.dumps({"endpoint": f"http://{commit_host}:{PORT}"})
+    external_endpoint = os.getenv("MINER_EXTERNAL_ENDPOINT", "")
+    if not external_endpoint:
+        commit_host = "127.0.0.1" if HOST == "0.0.0.0" else HOST
+        external_endpoint = f"http://{commit_host}:{PORT}"
+    endpoint_data = json.dumps({"endpoint": external_endpoint})
     try:
         subtensor.set_commitment(wallet=wallet, netuid=NETUID, data=endpoint_data)
         logger.info(f"Committed endpoint to chain: {endpoint_data}")

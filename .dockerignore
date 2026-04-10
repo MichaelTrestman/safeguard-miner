@@ -1,0 +1,8 @@
+.env
+.git
+.gitignore
+__pycache__
+*.pyc
+*.log
+*.md
+k8s/

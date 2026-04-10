@@ -36,7 +36,7 @@ spec:
             # created. The miner commits this to chain so validators
             # anywhere on the internet can reach it.
             - name: MINER_EXTERNAL_ENDPOINT
-              value: "REPLACE_WITH_EXTERNAL_IP:8090"
+              value: "http://34.172.160.243:8090"
             - name: MINER_ATTACK_MODEL
               value: "deepseek-ai/DeepSeek-V3.1-TEE"
             - name: MINER_JUDGE_MODEL
