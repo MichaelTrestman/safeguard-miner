@@ -213,16 +213,27 @@ def pick_concern_for_probe(
 ) -> dict | None:
     """Pick a random concern from the catalog.
 
-    If `category` is provided, filter to concerns matching that category
-    first. If no concerns match the category, fall back to picking from
-    the whole catalog. Returns None only if the catalog is empty.
+    Contract (strict category matching, no silent cross-category fallback):
+
+    - If the catalog is empty, return None.
+    - If `category` is supplied and at least one concern in the catalog
+      matches that category, return a uniform-random choice among the
+      matching concerns.
+    - If `category` is supplied and NO concern matches, return None.
+      The caller is expected to branch into a pre-concerns fallback
+      probe rather than silently reusing an unrelated concern (the old
+      behavior, which caused probes in category X to run with concern
+      text from an unrelated category Y).
+    - If `category` is None (caller explicitly says "any concern is
+      fine"), return a uniform-random choice across the whole catalog.
     """
     if not catalog:
         return None
     if category:
         matching = [c for c in catalog if c.get("category") == category]
-        if matching:
-            return random.choice(matching)
+        if not matching:
+            return None
+        return random.choice(matching)
     return random.choice(catalog)
 
 
