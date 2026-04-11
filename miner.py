@@ -195,6 +195,7 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
     turns = len(result.get("transcript", [])) // 2
     safety_score = result.get("miner_safety_score", 0.0)
     concern_id_slug = result.get("concern_id_slug")
+    trigger_id = result.get("trigger_id")
 
     # Record in-memory (existing behavior, feeds live dashboard)
     _probe_history.append({
@@ -206,6 +207,7 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
         "v2_relay": bool(safeguard_relay_endpoint),
         "variant_name": variant_name,
         "concern_id_slug": concern_id_slug,
+        "trigger_id": trigger_id,
     })
     # Record in SQLite (bucketed by variant, survives pod restart,
     # feeds per-variant stats page)
@@ -218,6 +220,7 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
             turns=turns,
             v2_relay=bool(safeguard_relay_endpoint),
             concern_id_slug=concern_id_slug,
+            trigger_id=trigger_id,
         )
     except Exception as e:
         logger.warning(f"Failed to record probe stat: {e}")
@@ -471,6 +474,8 @@ async def dashboard():
             score_color = "#22c55e"
         v2_badge = '<span style="color:#38bdf8;">v2</span>' if entry["v2_relay"] else '<span style="color:#a3a3a3;">v1</span>'
         variant_label = html_mod.escape(entry.get("variant_name", "—"))
+        trig_val = entry.get("trigger_id")
+        trig_label = str(trig_val) if trig_val is not None else "—"
         display_rows += f"""<tr>
             <td style="font-family:monospace;color:#d4d4d4;">{tid_trunc}</td>
             <td>{html_mod.escape(entry["category"])}</td>
@@ -478,6 +483,7 @@ async def dashboard():
             <td>{entry["turns"]}</td>
             <td>{v2_badge}</td>
             <td style="color:#a3a3a3;">{variant_label}</td>
+            <td style="color:#737373;font-size:0.85em;font-family:monospace;">{html_mod.escape(trig_label)}</td>
             <td style="color:#a3a3a3;font-size:0.85em;">{entry["timestamp"]}</td>
         </tr>"""
 
@@ -626,7 +632,7 @@ async def dashboard():
 </div>
 
 <h2 style="font-size:1rem;color:#a3a3a3;margin-bottom:12px;">Recent Probes (last 20)</h2>
-{"<table><thead><tr><th>Task ID</th><th>Category</th><th>Score</th><th>Turns</th><th>Relay</th><th>Variant</th><th>Time</th></tr></thead><tbody>" + display_rows + "</tbody></table>" if display_rows else '<div class="empty">No probes recorded yet.</div>'}
+{"<table><thead><tr><th>Task ID</th><th>Category</th><th>Score</th><th>Turns</th><th>Relay</th><th>Variant</th><th>Trigger</th><th>Time</th></tr></thead><tbody>" + display_rows + "</tbody></table>" if display_rows else '<div class="empty">No probes recorded yet.</div>'}
 
 <h2 style="font-size:1rem;color:#a3a3a3;margin:24px 0 12px 0;">Concern catalog (cached)</h2>
 <div style="display:flex;gap:16px;align-items:center;margin-bottom:12px;color:#a3a3a3;font-size:0.85rem;">

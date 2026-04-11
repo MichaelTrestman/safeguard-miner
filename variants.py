@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS probe_stat (
     v2_relay INTEGER NOT NULL,          -- 0/1
     created_at TEXT NOT NULL,
     concern_id_slug TEXT,               -- Concerns v2: which concern seeded this probe (nullable; NULL = v1 fallback / empty catalog)
+    trigger_id INTEGER,                 -- Concerns v2 precise attribution: UserTrigger row id on the validator (nullable; NULL = no trigger used)
     FOREIGN KEY (variant_id) REFERENCES miner_variant(id) ON DELETE SET NULL
 );
 
@@ -121,6 +122,11 @@ def init_db(default_variant: dict | None = None) -> None:
             }
             if "concern_id_slug" not in existing_cols:
                 conn.execute("ALTER TABLE probe_stat ADD COLUMN concern_id_slug TEXT")
+            # Concerns v2 precise attribution: add probe_stat.trigger_id
+            # on existing DBs in place (same PRAGMA table_info pattern as
+            # concern_id_slug above).
+            if "trigger_id" not in existing_cols:
+                conn.execute("ALTER TABLE probe_stat ADD COLUMN trigger_id INTEGER")
             # Default settings
             conn.execute(
                 "INSERT OR IGNORE INTO setting (key, value) VALUES (?, ?)",
@@ -394,6 +400,7 @@ def record_probe(
     turns: int,
     v2_relay: bool,
     concern_id_slug: str | None = None,
+    trigger_id: int | None = None,
 ) -> None:
     with _LOCK:
         conn = _connect()
@@ -402,13 +409,14 @@ def record_probe(
                 """
                 INSERT INTO probe_stat (
                     variant_id, task_id, category, safety_score, turns,
-                    v2_relay, created_at, concern_id_slug
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    v2_relay, created_at, concern_id_slug, trigger_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     variant_id, task_id, category, float(safety_score),
                     int(turns), 1 if v2_relay else 0, _now(),
                     concern_id_slug,
+                    int(trigger_id) if trigger_id is not None else None,
                 ),
             )
             # Keep the probe_stat table bounded — trim to last 5000 rows

@@ -226,14 +226,33 @@ def pick_concern_for_probe(
     return random.choice(catalog)
 
 
-def pick_triggers_for_probe(concern: dict, n: int = 3) -> list[dict]:
-    """Pick up to `n` user-triggers from a concern, uniform random
-    without replacement. Returns [] if the concern has no triggers
-    or if n <= 0."""
-    if not concern or n <= 0:
-        return []
+def pick_trigger_for_probe(concern: dict) -> dict | None:
+    """Pick ONE user-trigger from a concern, uniform random.
+
+    Returns a single trigger dict or None if the concern is empty or
+    has no triggers. The singular form exists because per-probe trigger
+    attribution is impossible when the attacker is told "pick one or
+    combine" — picking exactly one per probe lets the validator credit
+    that probe's finding to exactly one UserTrigger row.
+    """
+    if not concern:
+        return None
     triggers = concern.get("triggers") or []
     if not triggers:
-        return []
-    k = min(n, len(triggers))
-    return random.sample(triggers, k)
+        return None
+    return random.choice(triggers)
+
+
+def pick_triggers_for_probe(concern: dict, n: int = 3) -> list[dict]:
+    """DEPRECATED back-compat shim. Use `pick_trigger_for_probe` instead.
+
+    Returns a single-element list wrapping `pick_trigger_for_probe(concern)`
+    or an empty list if no trigger was available. The old multi-trigger
+    behavior is intentionally gone — see `pick_trigger_for_probe` for why.
+    """
+    logger.warning(
+        "pick_triggers_for_probe is DEPRECATED; use pick_trigger_for_probe "
+        "(singular). Returning a single-element list for back-compat."
+    )
+    single = pick_trigger_for_probe(concern)
+    return [single] if single is not None else []
