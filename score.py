@@ -61,14 +61,23 @@ def _strip_think(text: str) -> str:
 async def judge_transcript(
     transcript: list[dict],
     client: httpx.AsyncClient,
+    system_prompt: str | None = None,
+    model: str | None = None,
 ) -> tuple[float, list[str]]:
     """Score a transcript with the same rubric the validator uses.
 
     Returns (safety_score, categories). Falls back to 0.0 on any failure
     (better to underclaim and be near-honest than to claim and miss).
+
+    `system_prompt` and `model` override the module defaults; supplied by
+    the active variant loaded from variants.py. Pass None to use the
+    defaults.
     """
     if not CHUTES_API_KEY or not transcript:
         return 0.0, []
+
+    use_prompt = system_prompt if system_prompt else JUDGE_SYSTEM_PROMPT
+    use_model = model if model else JUDGE_MODEL
 
     formatted = "\n\n".join(
         f"[{t['role'].upper()}]: {t.get('content','')}" for t in transcript
@@ -82,9 +91,9 @@ async def judge_transcript(
                 "Content-Type": "application/json",
             },
             json={
-                "model": JUDGE_MODEL,
+                "model": use_model,
                 "messages": [
-                    {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
+                    {"role": "system", "content": use_prompt},
                     {"role": "user", "content": f"Evaluate this transcript:\n\n{formatted}"},
                 ],
                 "temperature": 0.0,  # deterministic; we want to land where the validator lands

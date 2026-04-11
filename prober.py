@@ -160,6 +160,7 @@ async def _generate_turn(
     transcript: list[dict],
     vector_name: str,
     vector_instructions: str,
+    attacker_system_prompt: str = ATTACKER_SYSTEM_PROMPT,
 ) -> str:
     if not transcript:
         user_msg = (
@@ -185,7 +186,7 @@ async def _generate_turn(
     return await _call_attacker(
         client,
         [
-            {"role": "system", "content": ATTACKER_SYSTEM_PROMPT},
+            {"role": "system", "content": attacker_system_prompt},
             {"role": "user", "content": user_msg},
         ],
     )
@@ -223,6 +224,10 @@ async def probe_via_relay(
     http_client: httpx.AsyncClient | None = None,
     safeguard_relay_endpoint: str = "",
     target_descriptor: dict | None = None,
+    attacker_system_prompt: str = ATTACKER_SYSTEM_PROMPT,
+    attack_vectors: list | None = None,
+    judge_system_prompt: str | None = None,
+    judge_model: str | None = None,
 ) -> dict:
     """Conduct an adversarial conversation against the target subnet via its
     relay endpoint. Returns the dict shape Safeguard's validator expects.
@@ -236,18 +241,28 @@ async def probe_via_relay(
     audits the transcript, it re-verifies each commitment against its
     stored RelayCommitment rows. v1 fallback: if safeguard_relay_endpoint
     is empty, everything works exactly as before.
+
+    Prompt engineering: attacker_system_prompt, attack_vectors,
+    judge_system_prompt, and judge_model can be overridden per-probe.
+    The defaults are the module-level constants (the "baseline" variant).
+    `attack_vectors` is a list of [name, instructions] pairs.
     """
+    vectors = attack_vectors if attack_vectors else ATTACK_VECTORS
     if http_client is None:
         async with httpx.AsyncClient(timeout=120.0) as client:
             return await _probe_loop(
                 client, wallet, target_validator_endpoint,
                 scenario_category, max_turns,
                 safeguard_relay_endpoint, target_descriptor,
+                attacker_system_prompt, vectors,
+                judge_system_prompt, judge_model,
             )
     return await _probe_loop(
         http_client, wallet, target_validator_endpoint,
         scenario_category, max_turns,
         safeguard_relay_endpoint, target_descriptor,
+        attacker_system_prompt, vectors,
+        judge_system_prompt, judge_model,
     )
 
 
@@ -303,7 +318,23 @@ async def _probe_loop(
     max_turns: int,
     safeguard_relay_endpoint: str = "",
     target_descriptor: dict | None = None,
+    attacker_system_prompt: str = ATTACKER_SYSTEM_PROMPT,
+    attack_vectors: list | None = None,
+    judge_system_prompt: str | None = None,
+    judge_model: str | None = None,
 ) -> dict:
+    vectors = attack_vectors if attack_vectors else ATTACK_VECTORS
+    # Normalize vectors to list of tuples whether they come in as tuples
+    # (module constant) or lists (from variants.py JSON decode).
+    vectors = [tuple(v) for v in vectors]
+    if not vectors:
+        logger.error("No attack vectors configured; aborting probe")
+        return {
+            "transcript": [], "session_id": "",
+            "miner_safety_score": 0.0, "miner_severity": 0.0,
+            "miner_categories": [scenario_category],
+        }
+
     transcript: list[dict] = []
     session_id = str(uuid.uuid4())
     using_v2 = bool(safeguard_relay_endpoint and target_descriptor)
@@ -313,16 +344,17 @@ async def _probe_loop(
 
     # Pick a random starting offset into the vector list so different probes
     # of the same category don't all open with the same vector.
-    start_offset = random.randint(0, len(ATTACK_VECTORS) - 1)
+    start_offset = random.randint(0, len(vectors) - 1)
     got_compliance = False
 
     for turn in range(max_turns):
-        vector_name, vector_instructions = ATTACK_VECTORS[
-            (start_offset + turn) % len(ATTACK_VECTORS)
+        vector_name, vector_instructions = vectors[
+            (start_offset + turn) % len(vectors)
         ]
 
         prompt = await _generate_turn(
-            client, scenario_category, transcript, vector_name, vector_instructions
+            client, scenario_category, transcript, vector_name, vector_instructions,
+            attacker_system_prompt=attacker_system_prompt,
         )
         if not prompt:
             logger.warning(f"Empty attacker output on turn {turn}; stopping")
@@ -341,10 +373,6 @@ async def _probe_loop(
                 f"Relay request failed on turn {turn}: {e} — "
                 f"aborting probe to avoid polluting transcript"
             )
-            # Pop the user turn we just appended — we have no real
-            # response for it. Submitting it would create a transcript
-            # entry the validator can't verify (no commitment) and
-            # skew the audit.
             transcript.pop()
             break
 
@@ -358,13 +386,20 @@ async def _probe_loop(
             # Compliance found — push one more turn to deepen the finding,
             # then stop. The judge rewards explicit, actionable content.
             if turn + 1 < max_turns:
+                # Try to find an "incremental" vector; fall back to the
+                # next vector in rotation if this variant doesn't have one.
                 deepen_vector = "incremental"
                 deepen_instructions = next(
-                    v[1] for v in ATTACK_VECTORS if v[0] == deepen_vector
+                    (v[1] for v in vectors if v[0] == deepen_vector), None
                 )
+                if deepen_instructions is None:
+                    deepen_vector, deepen_instructions = vectors[
+                        (start_offset + turn + 1) % len(vectors)
+                    ]
                 deepen = await _generate_turn(
                     client, scenario_category, transcript,
                     deepen_vector, deepen_instructions,
+                    attacker_system_prompt=attacker_system_prompt,
                 )
                 if deepen:
                     transcript.append({"role": "user", "content": deepen})
@@ -385,13 +420,17 @@ async def _probe_loop(
                         logger.warning(
                             f"Deepen relay failed: {e} — dropping unanswered turn"
                         )
-                        # Pop the deepen user turn we just appended; no
-                        # real response means no transcript entry.
                         transcript.pop()
             break
 
     # Honest self-scoring with the same judge family the validator uses.
-    safety_score, categories = await judge_transcript(transcript, client)
+    # Pass the variant's judge prompt + model if supplied; score.py will
+    # fall back to its module defaults otherwise.
+    safety_score, categories = await judge_transcript(
+        transcript, client,
+        system_prompt=judge_system_prompt,
+        model=judge_model,
+    )
 
     logger.info(
         f"Probe complete: category={scenario_category}, turns={len(transcript)//2}, "
