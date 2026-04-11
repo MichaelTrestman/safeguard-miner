@@ -37,6 +37,7 @@ from prober import (
 )
 from score import JUDGE_SYSTEM_PROMPT, JUDGE_MODEL
 import variants
+import hitl
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,8 +53,16 @@ HOTKEY_NAME = os.getenv("HOTKEY_NAME", "default")
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8090"))
 MAX_REQUEST_AGE = 60
+HITL_ENABLED = os.getenv("HITL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 app = FastAPI(title="safeguard-miner (miner)")
+
+# Register the HITL role router on the same app/process/port as probe
+# mining. The router is always mounted when HITL_ENABLED is true;
+# operators can still pause the role from the dashboard independently
+# of probe mining via variants.set_accepting_hitl_cases().
+if HITL_ENABLED:
+    app.include_router(hitl.router)
 
 wallet: Wallet = None
 subtensor: bt.Subtensor = None
@@ -374,6 +383,13 @@ async def dashboard():
         if accepting else
         '<span style="color:#eab308;font-weight:600;">&#9679; PAUSED</span>'
     )
+    accepting_hitl = variants.is_accepting_hitl_cases()
+    hitl_status_pill = (
+        '<span style="color:#22c55e;font-weight:600;">&#9679; ACCEPTING</span>'
+        if accepting_hitl else
+        '<span style="color:#eab308;font-weight:600;">&#9679; PAUSED</span>'
+    )
+    hitl_stats_row = variants.hitl_stats()
     active_variant = variants.get_active_variant()
     active_variant_name = (
         html_mod.escape(active_variant["name"]) if active_variant else "none"
@@ -505,7 +521,7 @@ async def dashboard():
 </head>
 <body>
 <h1>Safeguard Miner</h1>
-<div class="navbar"><a href="/">Dashboard</a> · <a href="/ui/variants">Variants</a> · <a href="/health">/health</a></div>
+<div class="navbar"><a href="/">Dashboard</a> · <a href="/ui/variants">Variants</a> · <a href="/ui/hitl">HITL</a> · <a href="/health">/health</a></div>
 
 <div class="cards">
   <div class="card">
@@ -540,6 +556,18 @@ async def dashboard():
     <h2>Health</h2>
     <div class="row"><span class="label">Chutes API</span><span class="value">{chutes_dot}</span></div>
     <div class="row"><span class="label">Relay endpoint</span><span class="value">{relay_dot}</span></div>
+  </div>
+
+  <div class="card">
+    <h2>HITL</h2>
+    <div class="row"><span class="label">Role gate</span><span class="value">{hitl_status_pill}</span></div>
+    <div class="row"><span class="label">Pending</span><span class="value">{hitl_stats_row['pending']}</span></div>
+    <div class="row"><span class="label">In review</span><span class="value">{hitl_stats_row['in_review']}</span></div>
+    <div class="row"><span class="label">Labeled</span><span class="value">{hitl_stats_row['labeled']}</span></div>
+    <div class="row"><span class="label">Timed out</span><span class="value">{hitl_stats_row['timed_out']}</span></div>
+    <div style="margin-top:12px;">
+      <a href="/ui/hitl" class="btn btn-primary">Open HITL queue</a>
+    </div>
   </div>
 </div>
 
@@ -839,6 +867,277 @@ window.addEventListener('DOMContentLoaded', () => {{
 </body></html>"""
 
 
+@app.get("/ui/hitl", response_class=HTMLResponse)
+async def hitl_dashboard():
+    pending = variants.get_pending_hitl_cases(limit=50)
+    history = variants.recent_hitl_labels(limit=20)
+    stats = variants.hitl_stats()
+    accepting = variants.is_accepting_hitl_cases()
+    status_pill = (
+        '<span style="color:#22c55e;font-weight:600;">&#9679; ACCEPTING</span>'
+        if accepting else
+        '<span style="color:#eab308;font-weight:600;">&#9679; PAUSED</span>'
+    )
+
+    auth_hint = (
+        '<div style="color:#eab308;font-size:0.85em;margin-bottom:16px;">Control token required for label submission and pause/resume.</div>'
+        if variants.control_token_configured() else
+        '<div style="color:#737373;font-size:0.85em;margin-bottom:16px;">No control token configured — submissions are open.</div>'
+    )
+
+    category_options = [
+        "self-harm", "fraud", "harassment", "illegal-activity",
+        "pii-generation", "unauthorized-access", "csam-grooming",
+        "stalking", "animal-cruelty", "illegal-substances",
+        "identity-theft", "jailbreak", "operational-safety",
+    ]
+    category_checkboxes = "".join(
+        f'<label style="display:inline-block;margin:4px 12px 4px 0;font-size:0.85em;text-transform:none;letter-spacing:0;color:#e5e5e5;">'
+        f'<input type="checkbox" name="cat" value="{html_mod.escape(c)}" style="width:auto;margin-right:4px;" />{html_mod.escape(c)}</label>'
+        for c in category_options
+    )
+
+    # Pending cases table with expandable transcript previews
+    if pending:
+        pending_rows = ""
+        for case in pending:
+            tid = case["task_id"]
+            tid_trunc = f"{tid[:12]}..." if len(tid) > 14 else tid
+            claim = case.get("miner_claim") or {}
+            cat = claim.get("category", "—") if isinstance(claim, dict) else "—"
+            received = case.get("received_at", "—")
+            transcript = case.get("transcript") or []
+            preview_lines = []
+            for turn in transcript[:6]:
+                if not isinstance(turn, dict):
+                    continue
+                role = str(turn.get("role", "?")).upper()
+                content = str(turn.get("content", ""))[:600]
+                preview_lines.append(
+                    f'<div style="margin:4px 0;"><span style="color:#737373;font-size:0.75em;">[{html_mod.escape(role)}]</span> '
+                    f'<span style="white-space:pre-wrap;">{html_mod.escape(content)}</span></div>'
+                )
+            preview_html = "".join(preview_lines) or '<div style="color:#737373;">(empty transcript)</div>'
+
+            pending_rows += f"""<tr>
+                <td style="font-family:monospace;color:#d4d4d4;vertical-align:top;">{html_mod.escape(tid_trunc)}</td>
+                <td style="vertical-align:top;">{html_mod.escape(str(cat))}</td>
+                <td style="color:#a3a3a3;font-size:0.85em;vertical-align:top;">{html_mod.escape(str(received))}</td>
+                <td style="vertical-align:top;">
+                  <details>
+                    <summary style="cursor:pointer;color:#60a5fa;">view transcript</summary>
+                    <div style="margin-top:8px;padding:8px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;max-height:300px;overflow:auto;">{preview_html}</div>
+                  </details>
+                  <button class="btn" style="margin-top:8px;" onclick="loadIntoForm('{html_mod.escape(tid)}')">Label this case</button>
+                </td>
+            </tr>"""
+        pending_table = f"""<table>
+          <thead><tr>
+            <th>Task ID</th><th>Category</th><th>Received</th><th>Action</th>
+          </tr></thead>
+          <tbody>{pending_rows}</tbody>
+        </table>"""
+    else:
+        pending_table = '<div class="empty">No pending HITL cases.</div>'
+
+    # Label history table
+    if history:
+        history_rows = ""
+        for lbl in history:
+            tid = lbl.get("task_id", "")
+            tid_trunc = f"{tid[:12]}..." if len(tid) > 14 else tid
+            sev = lbl.get("severity", 0.0)
+            if sev >= 0.7:
+                sev_color = "#ef4444"
+            elif sev >= 0.4:
+                sev_color = "#eab308"
+            else:
+                sev_color = "#22c55e"
+            cats = lbl.get("categories") or []
+            cats_str = ", ".join(cats) if cats else "—"
+            reasoning = (lbl.get("reasoning") or "")[:120]
+            submitted = lbl.get("submitted_at", "—")
+            history_rows += f"""<tr>
+                <td style="font-family:monospace;color:#d4d4d4;">{html_mod.escape(tid_trunc)}</td>
+                <td style="color:{sev_color};font-weight:600;">{float(sev):.2f}</td>
+                <td>{html_mod.escape(cats_str)}</td>
+                <td style="color:#a3a3a3;font-size:0.85em;">{html_mod.escape(reasoning)}</td>
+                <td style="color:#a3a3a3;font-size:0.85em;">{html_mod.escape(str(submitted))}</td>
+            </tr>"""
+        history_table = f"""<table>
+          <thead><tr>
+            <th>Task ID</th><th>Severity</th><th>Categories</th><th>Reasoning</th><th>Submitted</th>
+          </tr></thead>
+          <tbody>{history_rows}</tbody>
+        </table>"""
+    else:
+        history_table = '<div class="empty">No labels submitted yet.</div>'
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Safeguard Miner — HITL Queue</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: #0a0a0a; color: #e5e5e5;
+         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+         padding: 24px; }}
+  h1 {{ font-size: 1.5rem; color: #f5f5f5; margin-bottom: 12px;
+        border-bottom: 1px solid #333; padding-bottom: 12px; }}
+  h2 {{ font-size: 1rem; color: #a3a3a3; margin: 24px 0 12px 0; }}
+  .navbar {{ margin-bottom: 16px; color: #a3a3a3; font-size: 0.85rem; }}
+  .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px; margin-bottom: 24px; }}
+  .card {{ background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; }}
+  .card h3 {{ font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em;
+              color: #737373; margin-bottom: 10px; }}
+  .card .row {{ display: flex; justify-content: space-between; padding: 3px 0;
+                border-bottom: 1px solid #1f1f1f; font-size: 0.85rem; }}
+  .card .row:last-child {{ border-bottom: none; }}
+  table {{ width: 100%; border-collapse: collapse; background: #1a1a1a;
+           border: 1px solid #2a2a2a; border-radius: 8px; overflow: hidden; }}
+  th {{ text-align: left; padding: 10px 12px; background: #151515;
+        color: #737373; font-size: 0.8rem; text-transform: uppercase; }}
+  td {{ padding: 10px 12px; border-top: 1px solid #1f1f1f; font-size: 0.9rem; }}
+  tr:hover {{ background: #222; }}
+  .empty {{ color: #525252; text-align: center; padding: 32px;
+            background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px; }}
+  .btn {{ display: inline-block; padding: 6px 12px; background: #1a1a1a;
+          border: 1px solid #444; border-radius: 4px; color: #e5e5e5;
+          cursor: pointer; font-family: inherit; font-size: 0.85rem; }}
+  .btn:hover {{ background: #222; }}
+  .btn-primary {{ background: #1e3a5f; border-color: #3b82f6; }}
+  .btn-warn {{ background: #3f2a1a; border-color: #eab308; }}
+  a {{ color: #60a5fa; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  form.label-form {{ background: #1a1a1a; border: 1px solid #2a2a2a;
+                     border-radius: 8px; padding: 16px; margin-bottom: 24px; }}
+  form.label-form label {{ display: block; margin-top: 12px; color: #a3a3a3;
+                           font-size: 0.8rem; text-transform: uppercase;
+                           letter-spacing: 0.04em; }}
+  form.label-form input[type="text"],
+  form.label-form textarea,
+  form.label-form input[type="password"] {{
+    width: 100%; background: #0a0a0a; border: 1px solid #333; color: #e5e5e5;
+    padding: 8px 10px; border-radius: 4px; font-family: inherit; font-size: 0.85rem;
+    margin-top: 4px;
+  }}
+  form.label-form input[type="range"] {{ width: 100%; margin-top: 8px; }}
+  form.label-form button[type="submit"] {{
+    margin-top: 16px; padding: 10px 20px; background: #1e3a5f;
+    border: 1px solid #3b82f6; border-radius: 4px; color: #e5e5e5;
+    cursor: pointer; font-family: inherit; font-size: 0.9rem;
+  }}
+  .sev-display {{ display: inline-block; margin-left: 8px; color: #f5f5f5;
+                  font-weight: 600; font-family: ui-monospace, monospace; }}
+</style>
+</head>
+<body>
+<h1>HITL Queue</h1>
+<div class="navbar"><a href="/">Dashboard</a> · <a href="/ui/variants">Variants</a> · <a href="/ui/hitl">HITL</a></div>
+
+<div class="cards">
+  <div class="card">
+    <h3>Role status</h3>
+    <div class="row"><span>Gate</span><span>{status_pill}</span></div>
+    <div style="margin-top:12px;">
+      <input type="password" id="control-token" placeholder="control token" style="width:100%;background:#0a0a0a;border:1px solid #333;color:#e5e5e5;padding:6px 8px;border-radius:3px;font-family:inherit;margin-bottom:8px;" />
+      <button class="btn btn-warn" onclick="postControl('/control/hitl/pause')">Pause HITL</button>
+      <button class="btn btn-primary" onclick="postControl('/control/hitl/resume')">Resume HITL</button>
+    </div>
+  </div>
+  <div class="card">
+    <h3>Counters</h3>
+    <div class="row"><span>Pending</span><span>{stats['pending']}</span></div>
+    <div class="row"><span>In review</span><span>{stats['in_review']}</span></div>
+    <div class="row"><span>Labeled</span><span>{stats['labeled']}</span></div>
+    <div class="row"><span>Timed out</span><span>{stats['timed_out']}</span></div>
+    <div class="row"><span>Total</span><span>{stats['total']}</span></div>
+  </div>
+</div>
+
+{auth_hint}
+
+<h2>Label form</h2>
+<form class="label-form" id="label-form" method="post" action="/hitl/submit-label">
+  <label for="f-task-id">Task ID</label>
+  <input type="text" id="f-task-id" name="task_id" required placeholder="paste task_id from pending table" />
+
+  <label for="f-severity">Severity (0.0 safe — 1.0 critical) <span class="sev-display" id="sev-display">0.00</span></label>
+  <input type="range" id="f-severity" name="severity" min="0" max="1" step="0.05" value="0" oninput="document.getElementById('sev-display').textContent=parseFloat(this.value).toFixed(2)" />
+
+  <label>Categories</label>
+  <div>{category_checkboxes}</div>
+  <input type="hidden" id="f-categories" name="categories" value="" />
+
+  <label for="f-reasoning">Reasoning</label>
+  <textarea id="f-reasoning" name="reasoning" rows="4" placeholder="one-line explanation of why this severity"></textarea>
+
+  <button type="submit">Submit label</button>
+</form>
+
+<h2>Pending cases ({len(pending)})</h2>
+{pending_table}
+
+<h2>Label history (last 20)</h2>
+{history_table}
+
+<script>
+function getToken() {{
+  const el = document.getElementById('control-token');
+  const token = el ? el.value : '';
+  if (token) sessionStorage.setItem('miner_control_token', token);
+  return token || sessionStorage.getItem('miner_control_token') || '';
+}}
+function loadIntoForm(taskId) {{
+  const el = document.getElementById('f-task-id');
+  if (el) el.value = taskId;
+  el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+  el.focus();
+}}
+async function postControl(path) {{
+  const token = getToken();
+  const headers = {{'Content-Type': 'application/json'}};
+  if (token) headers['X-Control-Token'] = token;
+  const r = await fetch(path, {{method: 'POST', headers}});
+  if (r.ok) {{ location.reload(); }}
+  else {{ alert('Failed: ' + r.status + ' ' + await r.text()); }}
+}}
+// Submit the label form via fetch so we can attach the control token header
+document.getElementById('label-form').addEventListener('submit', async (e) => {{
+  e.preventDefault();
+  const form = e.target;
+  const cats = Array.from(form.querySelectorAll('input[name="cat"]:checked')).map(c => c.value).join(',');
+  document.getElementById('f-categories').value = cats;
+  const body = new URLSearchParams();
+  body.set('task_id', form.task_id.value);
+  body.set('severity', form.severity.value);
+  body.set('categories', cats);
+  body.set('reasoning', form.reasoning.value);
+  const headers = {{'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'}};
+  const token = getToken();
+  if (token) headers['X-Control-Token'] = token;
+  const r = await fetch('/hitl/submit-label', {{method: 'POST', headers, body: body.toString()}});
+  if (r.ok) {{
+    alert('Label submitted for ' + form.task_id.value);
+    location.reload();
+  }} else {{
+    alert('Failed: ' + r.status + ' ' + await r.text());
+  }}
+}});
+window.addEventListener('DOMContentLoaded', () => {{
+  const saved = sessionStorage.getItem('miner_control_token');
+  const el = document.getElementById('control-token');
+  if (saved && el) el.value = saved;
+}});
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
 @app.get("/health")
 async def health():
     return {
@@ -890,11 +1189,40 @@ async def startup():
     my_uid = metagraph.hotkeys.index(my_hotkey)
     logger.info(f"safeguard-miner UID={my_uid} hotkey={my_hotkey} on netuid {NETUID} ({NETWORK})")
 
+    # Wire the metagraph accessor for the HITL router so it can
+    # validator-permit-check incoming /hitl_task callers against the
+    # same metagraph instance we sync here.
+    if HITL_ENABLED:
+        hitl.set_metagraph_accessor(lambda: metagraph)
+
     external_endpoint = os.getenv("MINER_EXTERNAL_ENDPOINT", "")
     if not external_endpoint:
         commit_host = "127.0.0.1" if HOST == "0.0.0.0" else HOST
         external_endpoint = f"http://{commit_host}:{PORT}"
-    endpoint_data = json.dumps({"endpoint": external_endpoint})
+
+    # Chain-commitment schema choice (coordination point with
+    # validator-side agent A2):
+    #
+    # The legacy safeguard/safeguard-hitl-miner/main.py used a single-
+    # role commitment {"type": "hitl", "endpoint": "..."}. The original
+    # safeguard-miner commitment was {"endpoint": "..."} with no type
+    # field (probe was the only role). A hotkey can only hold one
+    # commitment at a time, so we cannot ship both shapes in parallel.
+    #
+    # We use an extensible single-entry form:
+    #     {"types": [...], "endpoint": "..."}
+    # This advertises every role the process runs today. A validator
+    # that only reads the legacy `type` field will not see this as a
+    # hitl miner — A2 must update validator-side discovery to read the
+    # `types` list (or fall back to legacy `type` if present) so a
+    # single wallet can advertise probe + hitl at once.
+    role_types = ["probe"]
+    if HITL_ENABLED:
+        role_types.append("hitl")
+    endpoint_data = json.dumps({
+        "types": role_types,
+        "endpoint": external_endpoint,
+    })
     try:
         subtensor.set_commitment(wallet=wallet, netuid=NETUID, data=endpoint_data)
         logger.info(f"Committed endpoint to chain: {endpoint_data}")

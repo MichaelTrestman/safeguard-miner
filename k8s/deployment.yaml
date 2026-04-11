@@ -41,6 +41,12 @@ spec:
               value: "deepseek-ai/DeepSeek-V3.1-TEE"
             - name: MINER_JUDGE_MODEL
               value: "deepseek-ai/DeepSeek-V3.1-TEE"
+            # Enables the HITL labeler role on the same app/port/wallet.
+            # When true, miner.py mounts hitl.router (adds /hitl_task,
+            # /hitl/submit-label, /ui/hitl, /control/hitl/*) and appends
+            # "hitl" to the chain-commitment types list.
+            - name: HITL_ENABLED
+              value: "true"
             - name: CHUTES_API_KEY
               valueFrom:
                 secretKeyRef:

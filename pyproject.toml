@@ -10,6 +10,10 @@ dependencies = [
   "python-dotenv",
   "bittensor",
   "bittensor-wallet",
+  # Required by FastAPI Form(...) — used on /hitl/submit-label for the
+  # dashboard label form POST. Without it, FastAPI raises at route-
+  # register time and miner.py crashes on `import hitl`.
+  "python-multipart",
 ]
 
 [tool.setuptools]

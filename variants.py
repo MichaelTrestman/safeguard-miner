@@ -65,6 +65,32 @@ CREATE TABLE IF NOT EXISTS probe_stat (
 
 CREATE INDEX IF NOT EXISTS idx_probe_stat_variant ON probe_stat(variant_id);
 CREATE INDEX IF NOT EXISTS idx_probe_stat_created ON probe_stat(created_at);
+
+CREATE TABLE IF NOT EXISTS hitl_case (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT UNIQUE NOT NULL,
+    transcript TEXT NOT NULL,           -- JSON list of {role, content}
+    miner_claim TEXT NOT NULL,          -- JSON of miner-reported claim/score
+    validator_audit TEXT NOT NULL,      -- JSON of validator audit context
+    status TEXT NOT NULL CHECK (status IN ('pending','in_review','labeled','timed_out')),
+    received_at TEXT NOT NULL,
+    labeled_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_hitl_case_status ON hitl_case(status);
+CREATE INDEX IF NOT EXISTS idx_hitl_case_received ON hitl_case(received_at);
+
+CREATE TABLE IF NOT EXISTS hitl_label (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id INTEGER NOT NULL,
+    severity REAL NOT NULL,
+    categories TEXT NOT NULL,           -- JSON list of strings
+    reasoning TEXT NOT NULL DEFAULT '',
+    submitted_at TEXT NOT NULL,
+    FOREIGN KEY (case_id) REFERENCES hitl_case(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_hitl_label_case ON hitl_label(case_id);
 """
 
 
@@ -88,6 +114,10 @@ def init_db(default_variant: dict | None = None) -> None:
             conn.execute(
                 "INSERT OR IGNORE INTO setting (key, value) VALUES (?, ?)",
                 ("accepting_probes", "1"),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO setting (key, value) VALUES (?, ?)",
+                ("accepting_hitl_cases", "1"),
             )
             # Seed default variant if table is empty
             count = conn.execute("SELECT COUNT(*) FROM miner_variant").fetchone()[0]
@@ -438,3 +468,255 @@ def check_control_token(provided: str | None) -> bool:
     if not expected:
         return True
     return provided is not None and provided == expected
+
+
+# -- HITL case store ------------------------------------------------------
+
+
+def is_accepting_hitl_cases() -> bool:
+    with _LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM setting WHERE key = ?",
+                ("accepting_hitl_cases",),
+            ).fetchone()
+            return row is not None and row["value"] == "1"
+        finally:
+            conn.close()
+
+
+def set_accepting_hitl_cases(accepting: bool) -> None:
+    with _LOCK:
+        conn = _connect()
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO setting (key, value) VALUES (?, ?)",
+                ("accepting_hitl_cases", "1" if accepting else "0"),
+            )
+        finally:
+            conn.close()
+
+
+def _row_to_hitl_case(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    for field in ("transcript", "miner_claim", "validator_audit"):
+        try:
+            d[field] = json.loads(d[field]) if d.get(field) else None
+        except (json.JSONDecodeError, TypeError):
+            d[field] = None
+    return d
+
+
+def insert_hitl_case(
+    task_id: str,
+    transcript: list | dict,
+    miner_claim: dict,
+    validator_audit: dict,
+) -> int | None:
+    """Insert a new hitl_case. Returns the row id, or None if a row with
+    this task_id already exists (idempotent on re-delivery)."""
+    with _LOCK:
+        conn = _connect()
+        try:
+            now = _now()
+            try:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO hitl_case (
+                        task_id, transcript, miner_claim, validator_audit,
+                        status, received_at
+                    ) VALUES (?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        task_id,
+                        json.dumps(transcript) if transcript is not None else "null",
+                        json.dumps(miner_claim) if miner_claim is not None else "null",
+                        json.dumps(validator_audit) if validator_audit is not None else "null",
+                        now,
+                    ),
+                )
+                return cursor.lastrowid
+            except sqlite3.IntegrityError:
+                return None
+        finally:
+            conn.close()
+
+
+def get_hitl_case_by_task_id(task_id: str) -> dict | None:
+    with _LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM hitl_case WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            return _row_to_hitl_case(row) if row else None
+        finally:
+            conn.close()
+
+
+def get_pending_hitl_cases(limit: int = 50) -> list[dict]:
+    with _LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM hitl_case
+                WHERE status IN ('pending','in_review')
+                ORDER BY received_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [_row_to_hitl_case(r) for r in rows]
+        finally:
+            conn.close()
+
+
+def set_hitl_case_status(task_id: str, status: str) -> bool:
+    if status not in ("pending", "in_review", "labeled", "timed_out"):
+        return False
+    with _LOCK:
+        conn = _connect()
+        try:
+            if status == "labeled":
+                cursor = conn.execute(
+                    "UPDATE hitl_case SET status = ?, labeled_at = ? WHERE task_id = ?",
+                    (status, _now(), task_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE hitl_case SET status = ? WHERE task_id = ?",
+                    (status, task_id),
+                )
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+
+def record_hitl_label(
+    case_id: int,
+    severity: float,
+    categories: list,
+    reasoning: str,
+) -> int:
+    """Insert a hitl_label row and flip the parent case to 'labeled'.
+    Returns the label row id."""
+    with _LOCK:
+        conn = _connect()
+        try:
+            now = _now()
+            cursor = conn.execute(
+                """
+                INSERT INTO hitl_label (
+                    case_id, severity, categories, reasoning, submitted_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    case_id,
+                    float(severity),
+                    json.dumps(list(categories)),
+                    reasoning or "",
+                    now,
+                ),
+            )
+            label_id = cursor.lastrowid
+            conn.execute(
+                "UPDATE hitl_case SET status = 'labeled', labeled_at = ? WHERE id = ?",
+                (now, case_id),
+            )
+            return label_id
+        finally:
+            conn.close()
+
+
+def recent_hitl_labels(limit: int = 20) -> list[dict]:
+    """Recent labels joined with their case for the history table."""
+    with _LOCK:
+        conn = _connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                    hl.id, hl.case_id, hl.severity, hl.categories, hl.reasoning,
+                    hl.submitted_at,
+                    hc.task_id, hc.received_at
+                FROM hitl_label hl
+                JOIN hitl_case hc ON hc.id = hl.case_id
+                ORDER BY hl.id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["categories"] = json.loads(d["categories"])
+                except (json.JSONDecodeError, TypeError):
+                    d["categories"] = []
+                out.append(d)
+            return out
+        finally:
+            conn.close()
+
+
+def get_label_by_task_id(task_id: str) -> dict | None:
+    """Fetch the most recent hitl_label for a task_id, joining through
+    hitl_case. Returns None if no label has been recorded.
+
+    This is the source of truth for a labeled case — `handle_hitl_task`
+    reads it on wake instead of a volatile in-memory payload dict, so
+    duplicate dispatches of the same task_id all converge to the same
+    persisted answer without racing on who-pops-the-dict-first."""
+    with _LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    hl.id, hl.case_id, hl.severity, hl.categories, hl.reasoning,
+                    hl.submitted_at,
+                    hc.task_id
+                FROM hitl_label hl
+                JOIN hitl_case hc ON hc.id = hl.case_id
+                WHERE hc.task_id = ?
+                ORDER BY hl.id DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            try:
+                d["categories"] = json.loads(d["categories"])
+            except (json.JSONDecodeError, TypeError):
+                d["categories"] = []
+            return d
+        finally:
+            conn.close()
+
+
+def hitl_stats() -> dict:
+    """Aggregate counters for the dashboard stats card."""
+    with _LOCK:
+        conn = _connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END), 0) AS pending,
+                    COALESCE(SUM(CASE WHEN status='in_review' THEN 1 ELSE 0 END), 0) AS in_review,
+                    COALESCE(SUM(CASE WHEN status='labeled'   THEN 1 ELSE 0 END), 0) AS labeled,
+                    COALESCE(SUM(CASE WHEN status='timed_out' THEN 1 ELSE 0 END), 0) AS timed_out,
+                    COUNT(*) AS total
+                FROM hitl_case
+                """
+            ).fetchone()
+            return dict(row) if row else {
+                "pending": 0, "in_review": 0, "labeled": 0,
+                "timed_out": 0, "total": 0,
+            }
+        finally:
+            conn.close()
