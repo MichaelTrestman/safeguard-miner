@@ -38,6 +38,7 @@ from prober import (
 from score import JUDGE_SYSTEM_PROMPT, JUDGE_MODEL
 import variants
 import hitl
+import concerns as concerns_mod
 
 logging.basicConfig(
     level=logging.INFO,
@@ -193,6 +194,7 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
 
     turns = len(result.get("transcript", [])) // 2
     safety_score = result.get("miner_safety_score", 0.0)
+    concern_id_slug = result.get("concern_id_slug")
 
     # Record in-memory (existing behavior, feeds live dashboard)
     _probe_history.append({
@@ -203,6 +205,7 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "v2_relay": bool(safeguard_relay_endpoint),
         "variant_name": variant_name,
+        "concern_id_slug": concern_id_slug,
     })
     # Record in SQLite (bucketed by variant, survives pod restart,
     # feeds per-variant stats page)
@@ -214,6 +217,7 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
             safety_score=safety_score,
             turns=turns,
             v2_relay=bool(safeguard_relay_endpoint),
+            concern_id_slug=concern_id_slug,
         )
     except Exception as e:
         logger.warning(f"Failed to record probe stat: {e}")
@@ -256,6 +260,17 @@ async def control_resume(request: Request):
     variants.set_accepting_probes(True)
     logger.info("Miner resumed via dashboard")
     return {"status": "resumed", "accepting_probes": True}
+
+
+@app.post("/control/concerns/refresh")
+async def control_concerns_refresh(request: Request):
+    """Drop the in-memory concerns cache. The next probe will re-fetch
+    from the validator's /api/concerns. Read-only with respect to the
+    validator — this is purely a local cache invalidation."""
+    _require_control_token(request)
+    concerns_mod.invalidate_cache()
+    logger.info("Concerns cache invalidated via dashboard")
+    return {"status": "ok", "cache": "invalidated"}
 
 
 # --- Variant endpoints ---------------------------------------------------
@@ -394,6 +409,45 @@ async def dashboard():
     active_variant_name = (
         html_mod.escape(active_variant["name"]) if active_variant else "none"
     )
+
+    # Concerns v2: render the cached concern catalog as a read-only
+    # table on the dashboard. Detection cues are NEVER surfaced here —
+    # the serializer should omit them, but we also strip them in
+    # concerns._sanitize_concern(). See Workstream 4 design notes.
+    concerns_snap = concerns_mod.cache_snapshot()
+    concerns_catalog = concerns_snap["catalog"]
+    concerns_version = concerns_snap["catalog_version"]
+    concerns_served_at = concerns_snap["served_at"]
+    concerns_fetched_at = concerns_snap["fetched_at"]
+    concerns_fetched_str = (
+        datetime.fromtimestamp(concerns_fetched_at, tz=timezone.utc).isoformat(timespec="seconds")
+        if concerns_fetched_at else "—"
+    )
+    if concerns_catalog:
+        concerns_rows = ""
+        for c in concerns_catalog:
+            title = html_mod.escape(str(c.get("title", "—")))
+            category = html_mod.escape(str(c.get("category", "—")))
+            sev_prior = c.get("severity_prior")
+            sev_str = f"{float(sev_prior):.2f}" if isinstance(sev_prior, (int, float)) else "—"
+            n_triggers = len(c.get("triggers") or [])
+            concerns_rows += f"""<tr>
+                <td>{title}</td>
+                <td style="color:#a3a3a3;">{category}</td>
+                <td style="color:#a3a3a3;">{sev_str}</td>
+                <td style="color:#a3a3a3;">{n_triggers}</td>
+            </tr>"""
+        concerns_table = (
+            "<table><thead><tr><th>Title</th><th>Category</th>"
+            "<th>Severity prior</th><th># triggers</th></tr></thead>"
+            f"<tbody>{concerns_rows}</tbody></table>"
+        )
+    else:
+        concerns_table = (
+            '<div class="empty">No concerns cached. '
+            'The catalog may be empty during the v2 migration window, '
+            'or the validator has not been contacted yet.</div>'
+        )
     auth_required_hint = (
         '<div style="font-size:0.75em;color:#eab308;margin-top:8px;">Control token required for mutations.</div>'
         if variants.control_token_configured() else
@@ -573,6 +627,16 @@ async def dashboard():
 
 <h2 style="font-size:1rem;color:#a3a3a3;margin-bottom:12px;">Recent Probes (last 20)</h2>
 {"<table><thead><tr><th>Task ID</th><th>Category</th><th>Score</th><th>Turns</th><th>Relay</th><th>Variant</th><th>Time</th></tr></thead><tbody>" + display_rows + "</tbody></table>" if display_rows else '<div class="empty">No probes recorded yet.</div>'}
+
+<h2 style="font-size:1rem;color:#a3a3a3;margin:24px 0 12px 0;">Concern catalog (cached)</h2>
+<div style="display:flex;gap:16px;align-items:center;margin-bottom:12px;color:#a3a3a3;font-size:0.85rem;">
+  <span>Entries: <span style="color:#f5f5f5;">{len(concerns_catalog)}</span></span>
+  <span>Catalog version: <span style="color:#f5f5f5;">{html_mod.escape(str(concerns_version) if concerns_version is not None else '—')}</span></span>
+  <span>Served at: <span style="color:#f5f5f5;">{html_mod.escape(str(concerns_served_at) if concerns_served_at else '—')}</span></span>
+  <span>Fetched at: <span style="color:#f5f5f5;">{concerns_fetched_str}</span></span>
+  <button class="btn btn-primary" onclick="postControl('/control/concerns/refresh')">Refresh</button>
+</div>
+{concerns_table}
 
 <p class="refresh">Page does not auto-refresh. Reload to update.</p>
 

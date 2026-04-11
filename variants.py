@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS probe_stat (
     turns INTEGER NOT NULL,
     v2_relay INTEGER NOT NULL,          -- 0/1
     created_at TEXT NOT NULL,
+    concern_id_slug TEXT,               -- Concerns v2: which concern seeded this probe (nullable; NULL = v1 fallback / empty catalog)
     FOREIGN KEY (variant_id) REFERENCES miner_variant(id) ON DELETE SET NULL
 );
 
@@ -110,6 +111,16 @@ def init_db(default_variant: dict | None = None) -> None:
         conn = _connect()
         try:
             conn.executescript(SCHEMA)
+            # Concerns v2 migration: add probe_stat.concern_id_slug on
+            # existing DBs where the column didn't exist before. SQLite
+            # doesn't support IF NOT EXISTS on ALTER TABLE ADD COLUMN,
+            # so we introspect PRAGMA table_info first.
+            existing_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(probe_stat)").fetchall()
+            }
+            if "concern_id_slug" not in existing_cols:
+                conn.execute("ALTER TABLE probe_stat ADD COLUMN concern_id_slug TEXT")
             # Default settings
             conn.execute(
                 "INSERT OR IGNORE INTO setting (key, value) VALUES (?, ?)",
@@ -382,6 +393,7 @@ def record_probe(
     safety_score: float,
     turns: int,
     v2_relay: bool,
+    concern_id_slug: str | None = None,
 ) -> None:
     with _LOCK:
         conn = _connect()
@@ -390,12 +402,13 @@ def record_probe(
                 """
                 INSERT INTO probe_stat (
                     variant_id, task_id, category, safety_score, turns,
-                    v2_relay, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    v2_relay, created_at, concern_id_slug
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     variant_id, task_id, category, float(safety_score),
                     int(turns), 1 if v2_relay else 0, _now(),
+                    concern_id_slug,
                 ),
             )
             # Keep the probe_stat table bounded — trim to last 5000 rows
