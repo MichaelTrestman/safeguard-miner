@@ -352,6 +352,23 @@ async def control_resume(request: Request, _user: str = Depends(require_dashboar
     return {"status": "resumed", "accepting_probes": True}
 
 
+@app.post("/control/concurrency")
+async def control_concurrency(request: Request, _user: str = Depends(require_dashboard_auth)):
+    """Update the MAX_CONCURRENT_PROBES cap at runtime without restarting
+    the pod. 0 = no cap (all probes run in parallel). Any positive integer
+    rebuilds the semaphore with that many slots."""
+    global _MAX_CONCURRENT_PROBES, _probe_semaphore
+    _require_control_token(request)
+    body = await request.json()
+    new_cap = int(body.get("cap", 0))
+    if new_cap < 0:
+        raise HTTPException(400, "cap must be >= 0")
+    _MAX_CONCURRENT_PROBES = new_cap
+    _probe_semaphore = asyncio.Semaphore(new_cap) if new_cap > 0 else None
+    logger.info(f"Concurrency cap updated to {new_cap} via dashboard")
+    return {"status": "ok", "max_concurrent_probes": new_cap}
+
+
 @app.post("/control/concerns/refresh")
 async def control_concerns_refresh(request: Request, _user: str = Depends(require_dashboard_auth)):
     """Drop the in-memory concerns cache. The next probe will re-fetch
@@ -709,6 +726,17 @@ async function postControl(path) {
   const headers = {'Content-Type': 'application/json'};
   if (token) headers['X-Control-Token'] = token;
   const r = await fetch(path, {method: 'POST', headers});
+  if (r.ok) { location.reload(); }
+  else { alert('Failed: ' + r.status + ' ' + await r.text()); }
+}
+async function setConcurrency() {
+  const cap = parseInt(document.getElementById('concurrency-cap').value) || 0;
+  const token = getToken();
+  const headers = {'Content-Type': 'application/json'};
+  if (token) headers['X-Control-Token'] = token;
+  const r = await fetch('/control/concurrency', {
+    method: 'POST', headers, body: JSON.stringify({cap})
+  });
   if (r.ok) { location.reload(); }
   else { alert('Failed: ' + r.status + ' ' + await r.text()); }
 }
@@ -1197,6 +1225,12 @@ async def dashboard(request: Request, _user: str = Depends(require_dashboard_aut
     <div class="row" style="margin-top:10px;"><span class="label">Peak</span><span class="value">{_peak_inflight}</span></div>
     <div class="row"><span class="label">Completed</span><span class="value">{_probes_completed}</span></div>
     <div class="row"><span class="label">Cap</span><span class="value">{_MAX_CONCURRENT_PROBES if _MAX_CONCURRENT_PROBES > 0 else "none"}</span></div>
+    <div style="margin-top:10px;">
+      <input type="number" id="concurrency-cap" value="{_MAX_CONCURRENT_PROBES}" min="0" max="50"
+             style="width:60px;margin-right:6px;" />
+      <button class="btn btn-primary" onclick="setConcurrency()">Set cap</button>
+      <span class="stat-sub" style="margin-left:6px;">0 = no cap</span>
+    </div>
   </div>
 
   <div class="card">
