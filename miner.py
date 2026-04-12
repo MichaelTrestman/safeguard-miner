@@ -954,6 +954,15 @@ async def dashboard(request: Request, _user: str = Depends(require_dashboard_aut
     chutes_dot = _health_dot(_chutes_ok)
     relay_dot = _health_dot(_relay_ok)
 
+    catalog_snap = concerns_mod.cache_snapshot()
+    if catalog_snap.get("fetched_at"):
+        from datetime import datetime, timezone
+        catalog_snap["fetched_at_fmt"] = datetime.fromtimestamp(
+            catalog_snap["fetched_at"], tz=timezone.utc,
+        ).strftime("%H:%M:%S UTC")
+    else:
+        catalog_snap["fetched_at_fmt"] = "never"
+
     accepting = variants.is_accepting_probes()
     status_pill = (
         '<span style="color:#22c55e;font-weight:600;">&#9679; ACCEPTING</span>'
@@ -1235,9 +1244,15 @@ async def dashboard(request: Request, _user: str = Depends(require_dashboard_aut
   </div>
 
   <div class="card">
-    <h2>Health</h2>
+    <h2>System Health</h2>
     <div class="row"><span class="label">Chutes API</span><span class="value">{chutes_dot}</span></div>
     <div class="row"><span class="label">Relay endpoint</span><span class="value">{relay_dot}</span></div>
+    <div style="margin-top:8px; border-top:1px solid #333; padding-top:8px;">
+      <div class="row"><span class="label">Catalog endpoint</span><span class="value" style="font-size:0.7rem;word-break:break-all;">{catalog_snap.get('endpoint') or '<span style=\"color:#f44\">not set</span>'}</span></div>
+      <div class="row"><span class="label">Catalog entries</span><span class="value">{len(catalog_snap.get('catalog', []))}</span></div>
+      <div class="row"><span class="label">Catalog fetched</span><span class="value" style="font-size:0.7rem;">{catalog_snap.get('fetched_at_fmt', 'never')}</span></div>
+      <div class="row"><span class="label">Catalog version</span><span class="value">{catalog_snap.get('catalog_version') or '—'}</span></div>
+    </div>
   </div>
 
   <div class="card">
