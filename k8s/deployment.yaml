@@ -47,6 +47,14 @@ spec:
             # "hitl" to the chain-commitment types list.
             - name: HITL_ENABLED
               value: "true"
+            # Cap concurrent in-flight probes to avoid overwhelming Chutes.
+            # At 10 probes/cycle from the validator, uncapped means 10
+            # simultaneous attacker LLM calls — Chutes rate-limits and
+            # half the batch fails with empty transcripts. Cap at 3 so
+            # probes queue and run 3-at-a-time; slower per batch but
+            # every probe produces a real transcript with provenance.
+            - name: MAX_CONCURRENT_PROBES
+              value: "3"
             - name: CHUTES_API_KEY
               valueFrom:
                 secretKeyRef:
