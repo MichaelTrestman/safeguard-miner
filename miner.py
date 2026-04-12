@@ -117,10 +117,21 @@ subtensor: bt.Subtensor = None
 metagraph: bt.Metagraph = None
 
 _probes_received = 0
+_probes_completed = 0
 _started_at = time.time()
 _probe_history: deque = deque(maxlen=100)
 _chutes_ok: bool | None = None  # None = unknown, True/False = last call result
 _relay_ok: bool | None = None
+
+# Concurrency tracking + optional cap. Observability for the dashboard
+# + a knob (MAX_CONCURRENT_PROBES env var) to prevent the miner from
+# trying to run more probes than the Chutes budget can sustain.
+_inflight_probes = 0
+_peak_inflight = 0
+_MAX_CONCURRENT_PROBES = int(os.getenv("MAX_CONCURRENT_PROBES", "0"))  # 0 = no cap
+_probe_semaphore: asyncio.Semaphore | None = (
+    asyncio.Semaphore(_MAX_CONCURRENT_PROBES) if _MAX_CONCURRENT_PROBES > 0 else None
+)
 
 
 def verify_epistula(timestamp: str, signature: str, hotkey: str, body: bytes) -> str:
@@ -163,7 +174,7 @@ async def verify_validator(request: Request, body: bytes = Depends(get_body)) ->
 
 @app.post("/probe")
 async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_validator)):
-    global _probes_received
+    global _probes_received, _inflight_probes, _peak_inflight, _probes_completed
 
     # Pause gate — operator can pause/resume probing from the dashboard.
     # When paused, return 503 so the validator can log the miner as
@@ -175,7 +186,17 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
             status_code=503,
         )
 
+    # Optional concurrency cap. When MAX_CONCURRENT_PROBES is set, the
+    # semaphore queues excess probes until a slot opens. The validator
+    # dispatches N probes per cycle (PROBES_PER_MINER_PER_CYCLE); the
+    # cap prevents the miner from trying more simultaneous Chutes calls
+    # than the API key can sustain.
+    if _probe_semaphore is not None:
+        await _probe_semaphore.acquire()
+
     _probes_received += 1
+    _inflight_probes += 1
+    _peak_inflight = max(_peak_inflight, _inflight_probes)
     body = await request.json()
 
     task_id = body.get("task_id", "unknown")
@@ -244,6 +265,9 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
     except Exception as e:
         logger.error(f"Probe failed: {e}")
         _relay_ok = False
+        _inflight_probes -= 1
+        if _probe_semaphore is not None:
+            _probe_semaphore.release()
         raise
 
     result["task_id"] = task_id
@@ -282,8 +306,14 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
     except Exception as e:
         logger.warning(f"Failed to record probe stat: {e}")
 
+    _inflight_probes -= 1
+    _probes_completed += 1
+    if _probe_semaphore is not None:
+        _probe_semaphore.release()
+
     logger.info(
-        f"Task {task_id} done: self_score={safety_score:.2f} turns={turns}"
+        f"Task {task_id} done: self_score={safety_score:.2f} turns={turns} "
+        f"inflight={_inflight_probes}"
     )
     return result
 
@@ -1158,6 +1188,15 @@ async def dashboard(request: Request, _user: str = Depends(require_dashboard_aut
     <h2>Top Categories</h2>
     {top_cats_html}
     <div class="stat-sub" style="margin-top:6px;">{probe_stats["distinct_categories"]} distinct category{("" if probe_stats["distinct_categories"] == 1 else "ies")} seen</div>
+  </div>
+
+  <div class="card">
+    <h2>Concurrency</h2>
+    <div class="stat-hero">{_inflight_probes}</div>
+    <div class="stat-sub">probes in flight right now</div>
+    <div class="row" style="margin-top:10px;"><span class="label">Peak</span><span class="value">{_peak_inflight}</span></div>
+    <div class="row"><span class="label">Completed</span><span class="value">{_probes_completed}</span></div>
+    <div class="row"><span class="label">Cap</span><span class="value">{_MAX_CONCURRENT_PROBES if _MAX_CONCURRENT_PROBES > 0 else "none"}</span></div>
   </div>
 
   <div class="card">
