@@ -52,6 +52,20 @@ spec:
                 secretKeyRef:
                   name: miner-secrets
                   key: chutes-api-key
+            # HTTP Basic Auth credentials for the operator dashboard
+            # and all mutation routes. /probe and /hitl_task stay
+            # Epistula-authed (validator-to-miner); /health stays open
+            # for the k8s liveness probe.
+            - name: DASHBOARD_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: miner-secrets
+                  key: dashboard-admin-user
+            - name: DASHBOARD_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: miner-secrets
+                  key: dashboard-admin-password
           volumeMounts:
             - name: wallets
               mountPath: /root/.bittensor/wallets/miner2/hotkeys/default

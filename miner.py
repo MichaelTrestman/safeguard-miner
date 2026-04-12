@@ -20,14 +20,16 @@ import time
 import hashlib
 import logging
 import asyncio
+import secrets as _secrets
 from collections import deque
 from datetime import datetime, timezone
 
 import html as html_mod
 
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException, Depends, Form
+from fastapi import FastAPI, Request, HTTPException, Depends, Form, status
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from bittensor_wallet.keypair import Keypair
 from bittensor_wallet import Wallet
 import bittensor as bt
@@ -57,6 +59,51 @@ MAX_REQUEST_AGE = 60
 HITL_ENABLED = os.getenv("HITL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 app = FastAPI(title="safeguard-miner (miner)")
+
+# ---- Dashboard Basic Auth ----------------------------------------------
+#
+# Gates every operator-facing and mutation route. /probe and /hitl_task
+# are NOT gated — those are validator-to-miner calls authenticated via
+# Epistula signatures (see prober/hitl.py verifiers). /health stays open
+# for the k8s liveness probe.
+#
+# Credentials come from env vars DASHBOARD_ADMIN_USER and
+# DASHBOARD_ADMIN_PASSWORD. If EITHER is unset, auth is DISABLED (local
+# dev / docker run without secrets). The k8s deploy always sets both.
+#
+# HTTP Basic over plain HTTP sends credentials in base64 — acceptable
+# for dev testnet, not for mainnet. A TLS terminator on the LB is a
+# follow-up.
+_dash_security = HTTPBasic(realm="safeguard-miner-dashboard")
+
+
+def require_dashboard_auth(
+    creds: HTTPBasicCredentials | None = Depends(_dash_security),
+) -> str:
+    expected_user = os.getenv("DASHBOARD_ADMIN_USER", "")
+    expected_pass = os.getenv("DASHBOARD_ADMIN_PASSWORD", "")
+    if not expected_user or not expected_pass:
+        return "anonymous"
+    if creds is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="dashboard auth required",
+            headers={"WWW-Authenticate": 'Basic realm="safeguard-miner-dashboard"'},
+        )
+    user_ok = _secrets.compare_digest(
+        creds.username.encode(), expected_user.encode()
+    )
+    pass_ok = _secrets.compare_digest(
+        creds.password.encode(), expected_pass.encode()
+    )
+    if not (user_ok and pass_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="dashboard auth failed",
+            headers={"WWW-Authenticate": 'Basic realm="safeguard-miner-dashboard"'},
+        )
+    return creds.username
+
 
 # Register the HITL role router on the same app/process/port as probe
 # mining. The router is always mounted when HITL_ENABLED is true;
@@ -260,7 +307,7 @@ def _require_control_token(request: Request) -> None:
 
 
 @app.post("/control/pause")
-async def control_pause(request: Request):
+async def control_pause(request: Request, _user: str = Depends(require_dashboard_auth)):
     _require_control_token(request)
     variants.set_accepting_probes(False)
     logger.info("Miner paused via dashboard")
@@ -268,7 +315,7 @@ async def control_pause(request: Request):
 
 
 @app.post("/control/resume")
-async def control_resume(request: Request):
+async def control_resume(request: Request, _user: str = Depends(require_dashboard_auth)):
     _require_control_token(request)
     variants.set_accepting_probes(True)
     logger.info("Miner resumed via dashboard")
@@ -276,7 +323,7 @@ async def control_resume(request: Request):
 
 
 @app.post("/control/concerns/refresh")
-async def control_concerns_refresh(request: Request):
+async def control_concerns_refresh(request: Request, _user: str = Depends(require_dashboard_auth)):
     """Drop the in-memory concerns cache. The next probe will re-fetch
     from the validator's /api/concerns. Read-only with respect to the
     validator — this is purely a local cache invalidation."""
@@ -290,7 +337,7 @@ async def control_concerns_refresh(request: Request):
 
 
 @app.get("/variants")
-async def list_variants_api(request: Request):
+async def list_variants_api(request: Request, _user: str = Depends(require_dashboard_auth)):
     return {
         "active_variant_id": (
             variants.get_active_variant()["id"]
@@ -302,7 +349,7 @@ async def list_variants_api(request: Request):
 
 
 @app.get("/variants/{variant_id}")
-async def get_variant_api(variant_id: int):
+async def get_variant_api(variant_id: int, _user: str = Depends(require_dashboard_auth)):
     v = variants.get_variant(variant_id)
     if v is None:
         raise HTTPException(404, "Variant not found")
@@ -310,7 +357,7 @@ async def get_variant_api(variant_id: int):
 
 
 @app.post("/variants")
-async def create_variant_api(request: Request):
+async def create_variant_api(request: Request, _user: str = Depends(require_dashboard_auth)):
     _require_control_token(request)
     body = await request.json()
     try:
@@ -330,7 +377,7 @@ async def create_variant_api(request: Request):
 
 
 @app.put("/variants/{variant_id}")
-async def update_variant_api(variant_id: int, request: Request):
+async def update_variant_api(variant_id: int, request: Request, _user: str = Depends(require_dashboard_auth)):
     _require_control_token(request)
     body = await request.json()
     ok = variants.update_variant(variant_id, **{
@@ -345,7 +392,7 @@ async def update_variant_api(variant_id: int, request: Request):
 
 
 @app.post("/variants/{variant_id}/activate")
-async def activate_variant_api(variant_id: int, request: Request):
+async def activate_variant_api(variant_id: int, request: Request, _user: str = Depends(require_dashboard_auth)):
     _require_control_token(request)
     ok = variants.set_active_variant(variant_id)
     if not ok:
@@ -355,7 +402,7 @@ async def activate_variant_api(variant_id: int, request: Request):
 
 
 @app.delete("/variants/{variant_id}")
-async def delete_variant_api(variant_id: int, request: Request):
+async def delete_variant_api(variant_id: int, request: Request, _user: str = Depends(require_dashboard_auth)):
     _require_control_token(request)
     ok = variants.delete_variant(variant_id)
     if not ok:
@@ -827,7 +874,7 @@ def _filter_probe_history(
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard(request: Request, _user: str = Depends(require_dashboard_auth)):
     uptime_s = int(time.time() - _started_at)
     uptime_str = _fmt_uptime(uptime_s)
     probes_per_hour = (_probes_received / max(uptime_s, 1)) * 3600
@@ -1155,7 +1202,7 @@ async def dashboard(request: Request):
 
 
 @app.get("/ui/variants", response_class=HTMLResponse)
-async def variants_dashboard():
+async def variants_dashboard(_user: str = Depends(require_dashboard_auth)):
     all_variants = variants.list_variants()
     stats = {s["id"]: s for s in variants.variant_stats()}
     active = variants.get_active_variant()
@@ -1233,12 +1280,12 @@ async function deleteVariant(id) {
 
 
 @app.get("/ui/variants/new", response_class=HTMLResponse)
-async def variant_new_page():
+async def variant_new_page(_user: str = Depends(require_dashboard_auth)):
     return HTMLResponse(content=_render_variant_form(variant=None))
 
 
 @app.get("/ui/variants/{variant_id}", response_class=HTMLResponse)
-async def variant_edit_page(variant_id: int):
+async def variant_edit_page(variant_id: int, _user: str = Depends(require_dashboard_auth)):
     v = variants.get_variant(variant_id)
     if v is None:
         raise HTTPException(404, "Variant not found")
@@ -1329,7 +1376,7 @@ async function submitForm(e) {{
 
 
 @app.get("/ui/hitl", response_class=HTMLResponse)
-async def hitl_dashboard():
+async def hitl_dashboard(_user: str = Depends(require_dashboard_auth)):
     pending = variants.get_pending_hitl_cases(limit=50)
     history = variants.recent_hitl_labels(limit=20)
     stats = variants.hitl_stats()
