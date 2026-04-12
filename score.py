@@ -137,36 +137,59 @@ async def judge_transcript(
         f"[{t['role'].upper()}]: {t.get('content','')}" for t in transcript
     )
 
-    try:
-        resp = await client.post(
-            CHUTES_API_URL,
-            headers={
-                "Authorization": f"Bearer {CHUTES_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": use_model,
-                "messages": [
-                    {"role": "system", "content": use_prompt},
-                    {"role": "user", "content": f"Evaluate this transcript:\n\n{formatted}"},
-                ],
-                "temperature": 0.0,  # deterministic; we want to land where the validator lands
-                "max_tokens": 512,
-            },
-            timeout=90.0,
-        )
-        resp.raise_for_status()
-        content = _strip_think(resp.json()["choices"][0]["message"]["content"])
-    except Exception as e:
-        logger.error(f"Judge call failed: {e}")
-        return 0.0, []
+    import time as _time
 
-    match = _JSON_RE.search(content)
-    if match:
+    for attempt in range(2):
         try:
-            data = json.loads(match.group())
-            return float(data.get("safety_score", 0.0)), list(data.get("categories", []))
-        except (json.JSONDecodeError, ValueError):
-            pass
-    logger.warning(f"Could not parse judge output: {content[:200]}")
+            t0 = _time.time()
+            resp = await client.post(
+                CHUTES_API_URL,
+                headers={
+                    "Authorization": f"Bearer {CHUTES_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": use_model,
+                    "messages": [
+                        {"role": "system", "content": use_prompt},
+                        {"role": "user", "content": f"Evaluate this transcript:\n\n{formatted}"},
+                    ],
+                    "temperature": 0.0,
+                    "max_tokens": 512,
+                },
+                timeout=90.0,
+            )
+            resp.raise_for_status()
+            content = _strip_think(resp.json()["choices"][0]["message"]["content"])
+            latency = _time.time() - t0
+
+            match = _JSON_RE.search(content)
+            if match:
+                try:
+                    data = json.loads(match.group())
+                    score = float(data.get("safety_score", 0.0))
+                    cats = list(data.get("categories", []))
+                    logger.info(
+                        f"Judge ok: score={score:.2f} cats={cats} "
+                        f"model={use_model} latency={latency:.1f}s"
+                    )
+                    return score, cats
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            logger.warning(
+                f"Judge parse failed (attempt {attempt+1}/2): "
+                f"{content[:200]}"
+            )
+        except Exception as e:
+            latency = _time.time() - t0 if 't0' in dir() else 0
+            logger.warning(
+                f"Judge call failed (attempt {attempt+1}/2): "
+                f"{type(e).__name__}: {str(e)[:150]} latency={latency:.1f}s"
+            )
+            if attempt == 0:
+                import asyncio
+                await asyncio.sleep(2)
+                continue
+
+    logger.error("Judge failed after 2 attempts — returning 0.0")
     return 0.0, []
