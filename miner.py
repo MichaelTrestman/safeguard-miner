@@ -792,6 +792,7 @@ def _render_page(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="15">
 <title>{html_mod.escape(title)}</title>
 <style>{css}</style>
 </head>
@@ -1266,7 +1267,7 @@ async def dashboard(request: Request, _user: str = Depends(require_dashboard_aut
 </div>
 {concerns_table}
 
-<p class="refresh">Page does not auto-refresh. Reload to update.</p>
+<p class="refresh">Auto-refreshes every 15 seconds.</p>
 """
     return HTMLResponse(content=_render_page("Safeguard Miner", "dashboard", body_html))
 
