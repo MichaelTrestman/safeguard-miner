@@ -51,12 +51,20 @@ _CACHE: dict = {
 
 def invalidate_cache() -> None:
     """Drop the in-memory catalog cache so the next fetch re-hits the
-    validator. Called by the dashboard's 'Refresh' button."""
+    validator. Called by the dashboard's 'Refresh' button and by the
+    prober's cache-miss retry path (via the `invalidate_catalog_cache`
+    alias below)."""
     _CACHE["fetched_at"] = 0.0
     _CACHE["catalog"] = []
     _CACHE["endpoint"] = None
     _CACHE["served_at"] = None
     _CACHE["catalog_version"] = None
+
+
+# Alias for the prober cache-miss retry path. Same behavior as
+# `invalidate_cache` — kept as a named alias so prober.py's callsite
+# reads naturally as "invalidate the catalog cache and refetch."
+invalidate_catalog_cache = invalidate_cache
 
 
 def cache_snapshot() -> dict:
@@ -207,34 +215,23 @@ async def fetch_concerns_catalog(
             await client.aclose()
 
 
-def pick_concern_for_probe(
-    catalog: list[dict],
-    category: str | None = None,
-) -> dict | None:
-    """Pick a random concern from the catalog.
+def get_concern_by_slug(catalog: list[dict], slug: str) -> dict | None:
+    """Direct lookup by concern id_slug. The validator now picks a
+    focal concern at dispatch time and sends its slug in the probe
+    task body; the miner just resolves the slug against its cached
+    catalog.
 
-    Contract (strict category matching, no silent cross-category fallback):
-
-    - If the catalog is empty, return None.
-    - If `category` is supplied and at least one concern in the catalog
-      matches that category, return a uniform-random choice among the
-      matching concerns.
-    - If `category` is supplied and NO concern matches, return None.
-      The caller is expected to branch into a pre-concerns fallback
-      probe rather than silently reusing an unrelated concern (the old
-      behavior, which caused probes in category X to run with concern
-      text from an unrelated category Y).
-    - If `category` is None (caller explicitly says "any concern is
-      fine"), return a uniform-random choice across the whole catalog.
+    Returns None if the slug isn't in the cached catalog — the caller
+    should refresh the cache once and retry before failing, to handle
+    the race where the validator dispatches a concern the miner's
+    TTL cache hasn't picked up yet.
     """
-    if not catalog:
+    if not slug:
         return None
-    if category:
-        matching = [c for c in catalog if c.get("category") == category]
-        if not matching:
-            return None
-        return random.choice(matching)
-    return random.choice(catalog)
+    for c in catalog:
+        if c.get("id_slug") == slug:
+            return c
+    return None
 
 
 def pick_trigger_for_probe(concern: dict) -> dict | None:
