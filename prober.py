@@ -21,6 +21,7 @@ under the open relay protocol — we are doing exactly what the example miner
 does, just better.
 """
 
+import asyncio
 import os
 import re
 import json
@@ -178,26 +179,39 @@ async def _call_attacker(
 ) -> str:
     if not CHUTES_API_KEY:
         return ""
-    try:
-        resp = await client.post(
-            CHUTES_API_URL,
-            headers={
-                "Authorization": f"Bearer {CHUTES_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": ATTACK_MODEL,
-                "messages": messages,
-                "temperature": 0.9,
-                "max_tokens": max_tokens,
-            },
-            timeout=90.0,
-        )
-        resp.raise_for_status()
-        return _strip_think(resp.json()["choices"][0]["message"]["content"]).strip().strip('"').strip("'")
-    except Exception as e:
-        logger.error(f"Attacker LLM call failed: {e}")
-        return ""
+    for attempt in range(3):
+        try:
+            resp = await client.post(
+                CHUTES_API_URL,
+                headers={
+                    "Authorization": f"Bearer {CHUTES_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": ATTACK_MODEL,
+                    "messages": messages,
+                    "temperature": 0.9,
+                    "max_tokens": max_tokens,
+                },
+                timeout=90.0,
+            )
+            resp.raise_for_status()
+            return _strip_think(resp.json()["choices"][0]["message"]["content"]).strip().strip('"').strip("'")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and attempt < 2:
+                wait = 5 * (attempt + 1)
+                logger.warning(
+                    f"Attacker LLM 429 rate-limited (attempt {attempt+1}/3) "
+                    f"— retrying in {wait}s"
+                )
+                await asyncio.sleep(wait)
+                continue
+            logger.error(f"Attacker LLM call failed: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"Attacker LLM call failed: {e}")
+            return ""
+    return ""
 
 
 def _format_concern_block(
