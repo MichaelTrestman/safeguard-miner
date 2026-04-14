@@ -55,6 +55,11 @@ spec:
             # every probe produces a real transcript with provenance.
             - name: MAX_CONCURRENT_PROBES
               value: "3"
+            # Experiments hold slots 3-10 min vs 30-60s for probes. Separate
+            # semaphore so experiment floods don't starve probes. See
+            # safeguard-ops dev-blog-012.
+            - name: MAX_CONCURRENT_EXPERIMENTS
+              value: "2"
             - name: CHUTES_API_KEY
               valueFrom:
                 secretKeyRef:
