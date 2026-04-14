@@ -379,6 +379,8 @@ async def handle_experiment(request: Request, validator_hotkey: str = Depends(ve
         safeguard_relay_endpoint = body.get("safeguard_relay_endpoint", "")
         target_descriptor = body.get("target_descriptor")
         target_validator_endpoint = body.get("target_validator_endpoint", "")
+        # v2: optional structured schema. Empty dict = v1 legacy mode.
+        field_schema = body.get("field_schema") or {}
 
         if not challenge_claim:
             raise HTTPException(400, "Missing challenge_claim")
@@ -401,6 +403,7 @@ async def handle_experiment(request: Request, validator_hotkey: str = Depends(ve
                 target_validator_endpoint=target_validator_endpoint,
                 safeguard_relay_endpoint=safeguard_relay_endpoint,
                 target_descriptor=target_descriptor,
+                field_schema=field_schema,
             )
             global _relay_ok, _chutes_ok
             _relay_ok = True
