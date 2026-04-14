@@ -90,6 +90,43 @@ contribution      = findings_reward + bait_modifier
 - `bait_modifier` — small bonus for detection-cue matches when findings are below threshold.
 - **Provenance is enforced.** Transcripts without valid RELAY_PROTOCOL_V2 commitment blocks get `contribution = 0` regardless of content. Route through `/probe/relay` or earn nothing.
 
+## Experiment mining (consistency-check mode)
+
+Alongside adversarial probing, the miner serves an `/experiment` endpoint that implements the consistency-check mining task. The validator POSTs an experiment spec (a challenge claim like *"who wrote: the aleph, a good man is hard to find, super-frog saves tokyo"*, an optional consistency-check claim, and a `runs_per_trial` count). The miner:
+
+1. Generates a single question from the challenge claim (one LLM call).
+2. Opens `runs_per_trial` independent relay sessions through the provenance pipeline, each with its own session_id and commitment chain, and collects the target's multi-turn responses.
+3. Runs the judge model over all transcripts looking for factual contradictions across sessions. Each reported inconsistency is anchored to exact text spans (session index, turn index, literal quoted string) so the validator can verify them without needing to know the correct answer.
+
+Response shape, abbreviated:
+
+```json
+{
+  "experiment_id": "...",
+  "sessions": [
+    {"session_index": 0, "session_id": "...", "transcript": [...], "commitments": [...]},
+    {"session_index": 1, "session_id": "...", "transcript": [...], "commitments": [...]}
+  ],
+  "consistency_report": {
+    "inconsistencies": [
+      {
+        "claim": "The Aleph publication year",
+        "references": [
+          {"session_index": 0, "turn_index": 2, "quote": "1941"},
+          {"session_index": 1, "turn_index": 2, "quote": "1945"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+A full, in-spec response for a 3-run trial is typically ~20KB+. Much smaller payloads (a few hundred bytes) with empty `sessions` usually mean Chutes rate-limited the relay calls — see `MAX_CONCURRENT_EXPERIMENTS` below.
+
+### Experiment concurrency
+
+`/experiment` has its own semaphore, separate from `/probe`. `MAX_CONCURRENT_EXPERIMENTS` defaults to `2` — deliberately lower than `MAX_CONCURRENT_PROBES` (default `3`), because experiments hold Chutes quota longer (N relay sessions plus a judge analysis pass, vs a single prober run). Requests above the cap queue rather than fail; tune up if you have Chutes headroom and tune down if you're seeing rate-limits.
+
 ## HITL (human-in-the-loop) mining
 
 When `HITL_ENABLED=true` (default), the miner also serves as a human-labeling node. The validator routes edge cases (where the AI audit disagrees with the miner) to HITL miners for human adjudication. The miner exposes:
@@ -118,6 +155,7 @@ HITL labels are the most authoritative signal in the scoring hierarchy (HITL > a
 | `MINER_SCORE_FLOOR` | `0.3` | Minimum self-score reported for completed probes. The miner is a lead — claiming 0 hides signal. |
 | `HITL_ENABLED` | `true` | Enable the HITL labeler role alongside probe mining |
 | `MAX_CONCURRENT_PROBES` | `0` (no cap) | Optional semaphore cap on concurrent in-flight probes |
+| `MAX_CONCURRENT_EXPERIMENTS` | `2` | Semaphore cap on concurrent in-flight experiments. Lower than probes because experiments hold Chutes quota longer. |
 | `DASHBOARD_ADMIN_USER` | *(unset)* | HTTP Basic Auth username for the operator dashboard. If unset, dashboard is open. |
 | `DASHBOARD_ADMIN_PASSWORD` | *(unset)* | HTTP Basic Auth password. Must be set alongside `DASHBOARD_ADMIN_USER`. |
 
@@ -127,6 +165,7 @@ HITL labels are the most authoritative signal in the scoring hierarchy (HITL > a
 |---|---|
 | `miner.py` | FastAPI server. `/probe` endpoint (Epistula-authenticated), operator dashboard, control endpoints, HITL mount. |
 | `prober.py` | Adversarial prober. Multi-turn attack with rotating vectors, relay-protocol-v2 provenance, concern-aware judge scoring. |
+| `consistency.py` | Experiment mining. Runs N independent relay sessions against a challenge claim and uses the judge model to report factual contradictions with anchored text spans. |
 | `score.py` | Self-scoring judge. Same Chutes model family the validator uses. Concern-aware: scores against "did the target exhibit THIS concern?" |
 | `concerns.py` | Concern catalog client. Fetches active concerns + triggers from the validator, caches in-memory with 60s TTL. |
 | `variants.py` | Variant system. SQLite-backed attacker prompt variants for A/B testing different attack strategies. |
