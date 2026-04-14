@@ -1,0 +1,112 @@
+# Test miner deployment — runs the experiments branch (with /experiment
+# endpoint + consistency.py) on the SuperPractice wallet.
+#
+# Key differences from prod (safeguard-miner/k8s/deployment.yaml):
+#   - Namespace: safeguard-miner-test
+#   - Wallet: SuperPractice (prod miner = miner2)
+#   - Image tag: safeguard-miner:experiments (prod = :latest)
+#   - Secrets: miner-test-secrets, wallet-superpractice
+#   - Service: LoadBalancer (needs public IP for chain commitment)
+#   - MINER_EXTERNAL_ENDPOINT must be updated after LB IP is assigned
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: safeguard-miner-test
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safeguard-miner-test
+  namespace: safeguard-miner-test
+  labels: { app: safeguard-miner-test }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: safeguard-miner-test }
+  template:
+    metadata:
+      labels: { app: safeguard-miner-test }
+    spec:
+      containers:
+        - name: miner
+          image: us-central1-docker.pkg.dev/safeguard-testnet/safeguard/safeguard-miner:experiments
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8090
+              name: http
+          env:
+            - name: WALLET_NAME
+              value: "SuperPractice"
+            - name: HOTKEY_NAME
+              value: "default"
+            - name: NETWORK
+              value: "test"
+            - name: NETUID
+              value: "444"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8090"
+            # PLACEHOLDER — update after LB assigns an external IP:
+            #   kubectl get svc safeguard-miner-test -n safeguard-miner-test
+            - name: MINER_EXTERNAL_ENDPOINT
+              value: "http://34.41.107.159:8090"
+            - name: MINER_ATTACK_MODEL
+              value: "deepseek-ai/DeepSeek-V3.1-TEE"
+            - name: MINER_JUDGE_MODEL
+              value: "deepseek-ai/DeepSeek-V3.1-TEE"
+            - name: HITL_ENABLED
+              value: "true"
+            - name: MAX_CONCURRENT_PROBES
+              value: "3"
+            - name: CHUTES_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: miner-test-secrets
+                  key: chutes-api-key
+            - name: DASHBOARD_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: miner-test-secrets
+                  key: dashboard-admin-user
+            - name: DASHBOARD_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: miner-test-secrets
+                  key: dashboard-admin-password
+          volumeMounts:
+            - name: wallets
+              mountPath: /root/.bittensor/wallets/SuperPractice/hotkeys/default
+              subPath: hotkey
+              readOnly: true
+            - name: wallets
+              mountPath: /root/.bittensor/wallets/SuperPractice/coldkeypub.txt
+              subPath: coldkeypub.txt
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8090
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: wallets
+          secret:
+            secretName: wallet-superpractice
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: safeguard-miner-test
+  namespace: safeguard-miner-test
+spec:
+  type: LoadBalancer
+  selector: { app: safeguard-miner-test }
+  ports:
+    - port: 8090
+      targetPort: 8090
+      name: http

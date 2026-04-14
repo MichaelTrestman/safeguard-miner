@@ -38,6 +38,7 @@ from prober import (
     probe_via_relay, ATTACKER_SYSTEM_PROMPT, ATTACK_VECTORS, ATTACK_MODEL,
 )
 from score import JUDGE_SYSTEM_PROMPT, JUDGE_MODEL
+from consistency import run_consistency_check
 import variants
 import hitl
 import concerns as concerns_mod
@@ -118,8 +119,11 @@ metagraph: bt.Metagraph = None
 
 _probes_received = 0
 _probes_completed = 0
+_experiments_received = 0
+_experiments_completed = 0
 _started_at = time.time()
 _probe_history: deque = deque(maxlen=100)
+_experiment_history: deque = deque(maxlen=50)
 _chutes_ok: bool | None = None  # None = unknown, True/False = last call result
 _relay_ok: bool | None = None
 
@@ -315,6 +319,102 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
         f"Task {task_id} done: self_score={safety_score:.2f} turns={turns} "
         f"inflight={_inflight_probes}"
     )
+    return result
+
+
+# --- Experiment endpoint -------------------------------------------------
+
+
+@app.post("/experiment")
+async def handle_experiment(request: Request, validator_hotkey: str = Depends(verify_validator)):
+    """Handle an experiment task from the validator.
+
+    Currently supports experiment_type="consistency" — runs N independent
+    relay sessions with the same factual challenge and reports any
+    inconsistencies found across the target's responses.
+    """
+    global _experiments_received, _experiments_completed
+
+    if not variants.is_accepting_probes():
+        return JSONResponse(
+            {"error": "miner paused", "accepting_probes": False},
+            status_code=503,
+        )
+
+    _experiments_received += 1
+    body = await request.json()
+
+    task_id = body.get("task_id", "unknown")
+    experiment_type = body.get("experiment_type", "")
+    challenge_claim = body.get("challenge_claim", "")
+    consistency_check_claim = body.get("consistency_check_claim", "")
+    runs_per_trial = body.get("runs_per_trial", 5)
+    safeguard_relay_endpoint = body.get("safeguard_relay_endpoint", "")
+    target_descriptor = body.get("target_descriptor")
+    target_validator_endpoint = body.get("target_validator_endpoint", "")
+
+    if not challenge_claim:
+        raise HTTPException(400, "Missing challenge_claim")
+    if experiment_type != "consistency":
+        raise HTTPException(400, f"Unknown experiment_type: {experiment_type}")
+
+    logger.info(
+        f"Experiment {task_id} from validator {validator_hotkey[:8]}... "
+        f"type={experiment_type} runs={runs_per_trial} "
+        f"challenge={challenge_claim[:80]}..."
+    )
+
+    try:
+        result = await run_consistency_check(
+            wallet=wallet,
+            challenge_claim=challenge_claim,
+            consistency_check_claim=consistency_check_claim,
+            runs_per_trial=runs_per_trial,
+            target_validator_endpoint=target_validator_endpoint,
+            safeguard_relay_endpoint=safeguard_relay_endpoint,
+            target_descriptor=target_descriptor,
+        )
+        global _relay_ok, _chutes_ok
+        _relay_ok = True
+        _chutes_ok = True
+    except Exception as e:
+        logger.error(f"Experiment failed: {e}")
+        raise
+
+    result["task_id"] = task_id
+
+    n_sessions = result.get("n_sessions", 0)
+    n_inconsistencies = len(
+        result.get("experiment_report", {}).get("inconsistencies", [])
+    )
+
+    _experiment_history.append({
+        "task_id": task_id,
+        "experiment_type": experiment_type,
+        "n_sessions": n_sessions,
+        "inconsistencies_found": n_inconsistencies,
+        "safety_score": result.get("miner_safety_score", 0.0),
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
+
+    _experiments_completed += 1
+    logger.info(
+        f"Experiment {task_id} done: sessions={n_sessions} "
+        f"inconsistencies={n_inconsistencies}"
+    )
+
+    # Debug: verify result is JSON-serializable before FastAPI tries
+    # and potentially fails silently
+    try:
+        _json_size = len(json.dumps(result))
+        logger.info(f"Experiment {task_id} response: {_json_size} bytes, returning to validator")
+    except Exception as e:
+        logger.error(f"Experiment {task_id} result not JSON-serializable: {e}")
+        return JSONResponse(
+            {"error": f"result serialization failed: {e}", "task_id": task_id},
+            status_code=500,
+        )
+
     return result
 
 
@@ -1271,6 +1371,14 @@ async def dashboard(request: Request, _user: str = Depends(require_dashboard_aut
       <a href="/ui/hitl" class="btn btn-primary">Open HITL queue</a>
     </div>
   </div>
+
+  <div class="card">
+    <h2>Experiments</h2>
+    <div class="stat-hero">{_experiments_completed}</div>
+    <div class="stat-sub">trials completed</div>
+    <div class="row" style="margin-top:10px;"><span class="label">Received</span><span class="value">{_experiments_received}</span></div>
+    <div class="row"><span class="label">Recent</span><span class="value">{len(_experiment_history)} in buffer</span></div>
+  </div>
 </div>
 
 <h2>Recent Probes (last 20{", filtered" if filters_active else ""})</h2>
@@ -1510,15 +1618,18 @@ async def hitl_dashboard(_user: str = Depends(require_dashboard_auth)):
             received = case.get("received_at", "—")
             transcript = case.get("transcript") or []
             preview_lines = []
-            for turn in transcript[:6]:
+            # Show full transcript — no turn or char truncation. The
+            # container's max-height + overflow:auto keeps the UI bounded.
+            for turn in transcript:
                 if not isinstance(turn, dict):
                     continue
                 role = str(turn.get("role", "?")).upper()
-                content = str(turn.get("content", ""))[:600]
+                content = str(turn.get("content", ""))
                 preview_lines.append(
                     f'<div style="margin:4px 0;"><span style="color:#737373;font-size:0.75em;">[{html_mod.escape(role)}]</span> '
                     f'<span style="white-space:pre-wrap;">{html_mod.escape(content)}</span></div>'
                 )
+            n_turns = len(preview_lines)
             preview_html = "".join(preview_lines) or '<div style="color:#737373;">(empty transcript)</div>'
 
             pending_rows += f"""<tr>
@@ -1527,8 +1638,8 @@ async def hitl_dashboard(_user: str = Depends(require_dashboard_auth)):
                 <td style="color:#a3a3a3;font-size:0.85em;vertical-align:top;">{html_mod.escape(str(received))}</td>
                 <td style="vertical-align:top;">
                   <details>
-                    <summary style="cursor:pointer;color:#60a5fa;">view transcript</summary>
-                    <div style="margin-top:8px;padding:8px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;max-height:300px;overflow:auto;">{preview_html}</div>
+                    <summary style="cursor:pointer;color:#60a5fa;">view transcript ({n_turns} turns)</summary>
+                    <div style="margin-top:8px;padding:8px;background:#0a0a0a;border:1px solid #2a2a2a;border-radius:4px;max-height:600px;overflow:auto;">{preview_html}</div>
                   </details>
                   <button class="btn" style="margin-top:8px;" onclick="loadIntoForm('{html_mod.escape(tid)}')">Label this case</button>
                 </td>
