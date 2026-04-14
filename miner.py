@@ -137,6 +137,18 @@ _probe_semaphore: asyncio.Semaphore | None = (
     asyncio.Semaphore(_MAX_CONCURRENT_PROBES) if _MAX_CONCURRENT_PROBES > 0 else None
 )
 
+# Experiment-specific concurrency cap. Experiments hold slots much longer
+# than probes (N sessions × multi-turn × LLM analysis ≈ 3-10 min vs.
+# 30-60s for a probe), so they get their own semaphore with a tighter
+# cap. Without this, 20 concurrent experiments flooded Chutes quota and
+# produced empty transcripts (see stress test 2026-04-14).
+_inflight_experiments = 0
+_peak_inflight_experiments = 0
+_MAX_CONCURRENT_EXPERIMENTS = int(os.getenv("MAX_CONCURRENT_EXPERIMENTS", "2"))
+_experiment_semaphore: asyncio.Semaphore | None = (
+    asyncio.Semaphore(_MAX_CONCURRENT_EXPERIMENTS) if _MAX_CONCURRENT_EXPERIMENTS > 0 else None
+)
+
 
 def verify_epistula(timestamp: str, signature: str, hotkey: str, body: bytes) -> str:
     request_time = int(timestamp) / 1e9
@@ -332,8 +344,14 @@ async def handle_experiment(request: Request, validator_hotkey: str = Depends(ve
     Currently supports experiment_type="consistency" — runs N independent
     relay sessions with the same factual challenge and reports any
     inconsistencies found across the target's responses.
+
+    Concurrency is bounded by `_experiment_semaphore` (MAX_CONCURRENT_EXPERIMENTS
+    env var, default 2). Experiments queue rather than flood Chutes quota.
+    A separate semaphore (not shared with /probe) so a flood of experiments
+    doesn't fully block adversarial probes.
     """
     global _experiments_received, _experiments_completed
+    global _inflight_experiments, _peak_inflight_experiments
 
     if not variants.is_accepting_probes():
         return JSONResponse(
@@ -341,81 +359,95 @@ async def handle_experiment(request: Request, validator_hotkey: str = Depends(ve
             status_code=503,
         )
 
+    # Acquire experiment semaphore BEFORE reading body — if capped and the
+    # slot isn't available, queue here rather than consuming resources.
+    if _experiment_semaphore is not None:
+        await _experiment_semaphore.acquire()
+
     _experiments_received += 1
-    body = await request.json()
-
-    task_id = body.get("task_id", "unknown")
-    experiment_type = body.get("experiment_type", "")
-    challenge_claim = body.get("challenge_claim", "")
-    consistency_check_claim = body.get("consistency_check_claim", "")
-    runs_per_trial = body.get("runs_per_trial", 5)
-    safeguard_relay_endpoint = body.get("safeguard_relay_endpoint", "")
-    target_descriptor = body.get("target_descriptor")
-    target_validator_endpoint = body.get("target_validator_endpoint", "")
-
-    if not challenge_claim:
-        raise HTTPException(400, "Missing challenge_claim")
-    if experiment_type != "consistency":
-        raise HTTPException(400, f"Unknown experiment_type: {experiment_type}")
-
-    logger.info(
-        f"Experiment {task_id} from validator {validator_hotkey[:8]}... "
-        f"type={experiment_type} runs={runs_per_trial} "
-        f"challenge={challenge_claim[:80]}..."
-    )
+    _inflight_experiments += 1
+    _peak_inflight_experiments = max(_peak_inflight_experiments, _inflight_experiments)
 
     try:
-        result = await run_consistency_check(
-            wallet=wallet,
-            challenge_claim=challenge_claim,
-            consistency_check_claim=consistency_check_claim,
-            runs_per_trial=runs_per_trial,
-            target_validator_endpoint=target_validator_endpoint,
-            safeguard_relay_endpoint=safeguard_relay_endpoint,
-            target_descriptor=target_descriptor,
-        )
-        global _relay_ok, _chutes_ok
-        _relay_ok = True
-        _chutes_ok = True
-    except Exception as e:
-        logger.error(f"Experiment failed: {e}")
-        raise
+        body = await request.json()
 
-    result["task_id"] = task_id
+        task_id = body.get("task_id", "unknown")
+        experiment_type = body.get("experiment_type", "")
+        challenge_claim = body.get("challenge_claim", "")
+        consistency_check_claim = body.get("consistency_check_claim", "")
+        runs_per_trial = body.get("runs_per_trial", 5)
+        safeguard_relay_endpoint = body.get("safeguard_relay_endpoint", "")
+        target_descriptor = body.get("target_descriptor")
+        target_validator_endpoint = body.get("target_validator_endpoint", "")
 
-    n_sessions = result.get("n_sessions", 0)
-    n_inconsistencies = len(
-        result.get("experiment_report", {}).get("inconsistencies", [])
-    )
+        if not challenge_claim:
+            raise HTTPException(400, "Missing challenge_claim")
+        if experiment_type != "consistency":
+            raise HTTPException(400, f"Unknown experiment_type: {experiment_type}")
 
-    _experiment_history.append({
-        "task_id": task_id,
-        "experiment_type": experiment_type,
-        "n_sessions": n_sessions,
-        "inconsistencies_found": n_inconsistencies,
-        "safety_score": result.get("miner_safety_score", 0.0),
-        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
-
-    _experiments_completed += 1
-    logger.info(
-        f"Experiment {task_id} done: sessions={n_sessions} "
-        f"inconsistencies={n_inconsistencies}"
-    )
-
-    # Debug: verify result is JSON-serializable before FastAPI tries
-    # and potentially fails silently
-    try:
-        _json_size = len(json.dumps(result))
-        logger.info(f"Experiment {task_id} response: {_json_size} bytes, returning to validator")
-    except Exception as e:
-        logger.error(f"Experiment {task_id} result not JSON-serializable: {e}")
-        return JSONResponse(
-            {"error": f"result serialization failed: {e}", "task_id": task_id},
-            status_code=500,
+        logger.info(
+            f"Experiment {task_id} from validator {validator_hotkey[:8]}... "
+            f"type={experiment_type} runs={runs_per_trial} "
+            f"inflight={_inflight_experiments}/{_MAX_CONCURRENT_EXPERIMENTS} "
+            f"challenge={challenge_claim[:80]}..."
         )
 
-    return result
+        try:
+            result = await run_consistency_check(
+                wallet=wallet,
+                challenge_claim=challenge_claim,
+                consistency_check_claim=consistency_check_claim,
+                runs_per_trial=runs_per_trial,
+                target_validator_endpoint=target_validator_endpoint,
+                safeguard_relay_endpoint=safeguard_relay_endpoint,
+                target_descriptor=target_descriptor,
+            )
+            global _relay_ok, _chutes_ok
+            _relay_ok = True
+            _chutes_ok = True
+        except Exception as e:
+            logger.error(f"Experiment failed: {e}")
+            raise
+
+        result["task_id"] = task_id
+
+        n_sessions = result.get("n_sessions", 0)
+        n_inconsistencies = len(
+            result.get("experiment_report", {}).get("inconsistencies", [])
+        )
+
+        _experiment_history.append({
+            "task_id": task_id,
+            "experiment_type": experiment_type,
+            "n_sessions": n_sessions,
+            "inconsistencies_found": n_inconsistencies,
+            "safety_score": result.get("miner_safety_score", 0.0),
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        })
+
+        _experiments_completed += 1
+        logger.info(
+            f"Experiment {task_id} done: sessions={n_sessions} "
+            f"inconsistencies={n_inconsistencies}"
+        )
+
+        # Debug: verify result is JSON-serializable before FastAPI tries
+        # and potentially fails silently
+        try:
+            _json_size = len(json.dumps(result))
+            logger.info(f"Experiment {task_id} response: {_json_size} bytes, returning to validator")
+        except Exception as e:
+            logger.error(f"Experiment {task_id} result not JSON-serializable: {e}")
+            return JSONResponse(
+                {"error": f"result serialization failed: {e}", "task_id": task_id},
+                status_code=500,
+            )
+
+        return result
+    finally:
+        _inflight_experiments -= 1
+        if _experiment_semaphore is not None:
+            _experiment_semaphore.release()
 
 
 # --- Control endpoint auth (shared-secret token) ------------------------
@@ -1377,7 +1409,8 @@ async def dashboard(request: Request, _user: str = Depends(require_dashboard_aut
     <div class="stat-hero">{_experiments_completed}</div>
     <div class="stat-sub">trials completed</div>
     <div class="row" style="margin-top:10px;"><span class="label">Received</span><span class="value">{_experiments_received}</span></div>
-    <div class="row"><span class="label">Recent</span><span class="value">{len(_experiment_history)} in buffer</span></div>
+    <div class="row"><span class="label">Inflight</span><span class="value">{_inflight_experiments} / {_MAX_CONCURRENT_EXPERIMENTS if _MAX_CONCURRENT_EXPERIMENTS > 0 else "∞"}</span></div>
+    <div class="row"><span class="label">Peak inflight</span><span class="value">{_peak_inflight_experiments}</span></div>
   </div>
 </div>
 
