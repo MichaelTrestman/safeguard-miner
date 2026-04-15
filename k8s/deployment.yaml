@@ -59,7 +59,7 @@ spec:
             # semaphore so experiment floods don't starve probes. See
             # safeguard-ops dev-blog-012.
             - name: MAX_CONCURRENT_EXPERIMENTS
-              value: "2"
+              value: "10"
             - name: CHUTES_API_KEY
               valueFrom:
                 secretKeyRef:

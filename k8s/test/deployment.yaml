@@ -60,6 +60,11 @@ spec:
               value: "true"
             - name: MAX_CONCURRENT_PROBES
               value: "3"
+            # Symmetric with safeguard-miner/k8s/deployment.yaml — both
+            # miners serve both validators (same SN444 chain), so leaving
+            # one capped at the default 2 was a silent throughput bottleneck.
+            - name: MAX_CONCURRENT_EXPERIMENTS
+              value: "10"
             - name: CHUTES_API_KEY
               valueFrom:
                 secretKeyRef:
