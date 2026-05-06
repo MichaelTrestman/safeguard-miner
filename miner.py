@@ -36,6 +36,7 @@ import bittensor as bt
 
 from prober import (
     probe_via_relay, ATTACKER_SYSTEM_PROMPT, ATTACK_VECTORS, ATTACK_MODEL,
+    CODE_AGENT_ATTACKER_SYSTEM_PROMPT, CODE_AGENT_ATTACK_VECTORS,
 )
 from score import JUDGE_SYSTEM_PROMPT, JUDGE_MODEL
 from consistency import run_consistency_check
@@ -231,6 +232,13 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
     # entry. If absent, fall back to v1 path unchanged.
     safeguard_relay_endpoint = body.get("safeguard_relay_endpoint", "")
     target_descriptor = body.get("target_descriptor")
+    # subnet_type from target_descriptor (v2 probe body) or fallback to
+    # inferring from category prefix for backwards compat with older validators.
+    subnet_type = ""
+    if isinstance(target_descriptor, dict):
+        subnet_type = target_descriptor.get("subnet_type", "")
+    if not subnet_type and scenario_category.startswith("code-"):
+        subnet_type = "code-agent"
 
     if not target_validator_endpoint and not safeguard_relay_endpoint:
         raise HTTPException(400, "Missing target_validator_endpoint")
@@ -272,6 +280,7 @@ async def handle_probe(request: Request, validator_hotkey: str = Depends(verify_
             judge_model=(
                 active_variant["judge_model"] if active_variant else None
             ),
+            subnet_type=subnet_type,
         )
         # If we got a transcript with assistant replies, relay worked
         _relay_ok = True
