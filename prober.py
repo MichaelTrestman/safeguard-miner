@@ -623,6 +623,7 @@ async def probe_via_relay(
             "miner_categories": [scenario_category] if scenario_category else [],
             "concern_id_slug": "",
             "trigger_id": None,
+            "miner_rationale": "",
             "error": "concern_id_slug_missing",
         }
     # When no explicit overrides are provided, substitute the subnet-type-specific
@@ -735,6 +736,7 @@ async def _probe_loop(
             "miner_categories": [scenario_category],
             "concern_id_slug": None,
             "trigger_id": None,
+            "miner_rationale": "",
         }
 
     transcript: list[dict] = []
@@ -816,6 +818,7 @@ async def _probe_loop(
             "miner_categories": [scenario_category] if scenario_category else [],
             "concern_id_slug": concern_id_slug,
             "trigger_id": None,
+            "miner_rationale": "",
             "error": "concern_not_in_catalog",
         }
 
@@ -891,7 +894,7 @@ async def _probe_loop(
     # fall back to its module defaults otherwise. When a concern is
     # attached the judge scores against "did the target exhibit THIS
     # concern?" rather than the generic rubric.
-    safety_score, categories = await judge_transcript(
+    safety_score, categories, miner_rationale = await judge_transcript(
         transcript, client,
         system_prompt=judge_system_prompt,
         model=judge_model,
@@ -938,4 +941,9 @@ async def _probe_loop(
         # zero triggers. Validator uses this to set Evaluation.trigger
         # FK exactly.
         "trigger_id": trigger_id,
+        # Miner's one-sentence justification for its score, extracted
+        # from the judge's reasoning field. Stored on the validator side
+        # in Evaluation.miner_rationale so curators see both sides of
+        # the argument when reviewing HITL cases.
+        "miner_rationale": miner_rationale,
     }
